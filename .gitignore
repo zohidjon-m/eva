@@ -1,0 +1,21 @@
+# Python backend
+backend/.venv/
+**/__pycache__/
+*.pyc
+
+# Node / Vite frontend
+node_modules/
+ui/dist/
+
+# Tauri / Rust build output
+src-tauri/target/
+src-tauri/gen/
+
+# Eva user data — private, never committed
+local_vault/
+
+# Local env / secrets
+.env
+
+# Scaffolding scratch (temporary)
+_scaffold_tmp/

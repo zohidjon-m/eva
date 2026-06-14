@@ -1,0 +1,5 @@
+# Eva backend — Phase 0 dependencies.
+# Kept deliberately tiny: only what the health spine needs. Later phases add
+# their own deps (llama client, chromadb, faster-whisper, kokoro, ...).
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
