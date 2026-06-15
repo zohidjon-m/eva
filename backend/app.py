@@ -10,12 +10,23 @@ port 8420) and makes no outbound network calls. It talks only to the local
 llama-server it supervises. See ``dev.ps1`` for how it is launched in dev.
 """
 
+import asyncio
 import contextlib
+import logging
+from datetime import datetime
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from llm import client, server
+from memory import db, extract, vault
+
+logger = logging.getLogger("eva.backend")
+
+# Hold a strong reference to in-flight background extraction tasks. asyncio only
+# keeps a weak reference to tasks, so without this set a fire-and-forget
+# extraction could be garbage-collected mid-run. Tasks remove themselves on done.
+_extraction_tasks: set[asyncio.Task] = set()
 
 
 @contextlib.asynccontextmanager
@@ -25,9 +36,11 @@ async def lifespan(_app: FastAPI):
     Warming llama-server at startup means the first chat turn is fast instead of
     paying model-load latency. Best-effort: if the binary or model is missing the
     backend still comes up healthy (just not "ready"), so the app never fails to
-    launch over a missing model. Exists to own the llama-server lifecycle
-    alongside the backend's own.
+    launch over a missing model. Also initializes the derived SQLite store so the
+    very first captured turn has somewhere to land. Exists to own the
+    llama-server lifecycle alongside the backend's own.
     """
+    db.init_db()
     with contextlib.suppress(Exception):
         await server.ensure_running()
     try:
@@ -71,16 +84,73 @@ def health() -> dict:
     return server.status()
 
 
+def _capture_turn(text: str) -> int:
+    """Persist one user turn to the vault and the derived DB; return its id.
+
+    Writes L0 Markdown first (the source of truth), then mirrors the same
+    identity into SQLite using the vault's timestamp so the two agree. Runs as one
+    synchronous unit because capture must complete — and survive — regardless of
+    the model: the user's words are safe on disk before any reply is generated.
+    Synchronous on purpose; the caller offloads it to a thread so it never blocks
+    the event loop.
+    """
+    record = vault.append_entry(text, entry_type="chat")
+    return db.insert_entry(
+        date=record["date"],
+        entry_type="chat",
+        text=text,
+        created_at=record["timestamp"],
+    )
+
+
+async def _extract_turn(entry_id: int, text: str) -> None:
+    """Run L1 extraction for a saved turn and store it; swallow all failures.
+
+    Scheduled fire-and-forget after capture so the user never waits on it. It
+    asks the model for ``{summary, mood, entities, themes}`` (storing nulls if the
+    model is down or its output won't parse) and writes the result to SQLite. Any
+    error here is logged and dropped — a failed extraction must never disturb the
+    already-saved entry.
+    """
+    try:
+        result = await extract.extract(text)
+        await asyncio.to_thread(
+            db.save_extraction,
+            entry_id,
+            summary=result["summary"],
+            mood=result["mood"],
+            entities=result["entities"],
+            themes=result["themes"],
+            created_at=datetime.now().isoformat(timespec="seconds"),
+        )
+    except Exception:  # noqa: BLE001 — background task must never propagate
+        logger.exception("extraction failed for entry %s", entry_id)
+
+
+def _schedule_extraction(entry_id: int, text: str) -> None:
+    """Launch background extraction for a turn, tracking the task safely.
+
+    Keeps a strong reference in ``_extraction_tasks`` until the task finishes so
+    it isn't garbage-collected, then auto-removes it. Exists so the chat handler
+    can kick off extraction in one readable line without leaking tasks.
+    """
+    task = asyncio.create_task(_extract_turn(entry_id, text))
+    _extraction_tasks.add(task)
+    task.add_done_callback(_extraction_tasks.discard)
+
+
 @app.websocket("/chat")
 async def chat(websocket: WebSocket) -> None:
     """Stream a single chat reply token-by-token over a WebSocket.
 
-    Protocol (Phase 1, single-turn, no persistence): the client sends
-    ``{"message": "..."}``; the server ensures llama-server is up, then emits
-    ``{"type": "token", "text": ...}`` frames as Gemma generates, followed by a
-    final ``{"type": "done"}``. If the model is unavailable or generation fails,
-    it sends ``{"type": "error", "message", "hint"}`` instead of crashing the
-    socket. Exists to prove the streaming spine end-to-end before any UI.
+    Protocol: the client sends ``{"message": "..."}``; the server first persists
+    the user's turn (vault + DB) and kicks off background extraction, then ensures
+    llama-server is up and emits ``{"type": "token", "text": ...}`` frames as
+    Gemma generates, followed by a final ``{"type": "done"}``. If the model is
+    unavailable or generation fails, it sends ``{"type": "error", "message",
+    "hint"}`` instead of crashing the socket — but the turn is already saved by
+    then, so capture never depends on the model. Exists to prove the streaming
+    spine end-to-end and to make every turn durable from day one.
     """
     await websocket.accept()
     try:
@@ -91,6 +161,16 @@ async def chat(websocket: WebSocket) -> None:
                 {"type": "error", "message": "empty message", "hint": ""}
             )
             return
+
+        # Capture first, before anything that can fail on the model side. If
+        # persistence itself fails we log and continue — a storage glitch should
+        # not deny the user a reply — but this is the one thing we try hardest to
+        # do, because an unsaved entry can never be recovered.
+        try:
+            entry_id = await asyncio.to_thread(_capture_turn, user_message)
+            _schedule_extraction(entry_id, user_message)
+        except Exception:  # noqa: BLE001 — never crash the socket on a save error
+            logger.exception("failed to capture chat turn")
 
         state = await server.ensure_running()
         if not state.get("ready"):

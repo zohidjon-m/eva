@@ -113,3 +113,71 @@ any UI. The missing-model/binary path degrades gracefully instead of crashing.
   as a sidecar is Phase 15.
 
 ---
+
+## Phase 2 — Vault: real entry capture (L0 + basic L1) ✅
+
+**Status:** complete · **Date:** 2026-06-15
+
+Every chat turn is now genuinely persisted from day one: written to plain
+Markdown (the source of truth), mirrored into SQLite for querying, and enriched
+by a background extraction — none of which can block or undo the save.
+
+### What shipped
+- **`backend/memory/vault.py` (L0)** — append-only daily journal. One file per
+  day at `local_vault/journal/YYYY-MM-DD.md` with YAML frontmatter; each turn
+  appended as a timestamped Markdown block (`## HH:MM:SS · <type>`). Plain LF
+  UTF-8, readable in any editor or with `grep`; never rewritten or reordered.
+- **`backend/memory/db.py`** — derived SQLite store at `local_vault/eva.db`:
+  `entries` (id, date, type, text, created_at) and `extractions` (entry_id,
+  summary, mood −5..+5, entities/themes as JSON, created_at), plus an FTS5 index
+  over `entries.text` kept in sync by triggers (external-content pattern).
+  Fresh connection per call (thread-safe across the request + background task);
+  foreign keys on so deleting an entry cascades to its extraction.
+- **`backend/memory/extract.py` (basic L1)** — one bounded, low-temperature
+  model call per entry → strict JSON `{summary, mood, entities, themes}`, via a
+  few-shot prompt. Defensive `parse_extraction` recovers JSON from prose/fences
+  and normalizes/clamps fields; on parse failure it retries once, then stores
+  nulls. Never raises into the caller.
+- **`backend/llm/client.py`** — added `complete_chat` (non-streaming one-shot
+  completion) for extraction, alongside the existing `stream_chat`.
+- **`backend/app.py`** — `WS /chat` now captures the user's turn (vault + DB)
+  and schedules background extraction *before* touching the model, so capture is
+  independent of model readiness. `init_db()` runs at startup. Background tasks
+  are tracked in a set so they aren't GC'd; all their failures are logged and
+  swallowed.
+- **Tests** — `backend/tests/test_extract.py` (8 cases) covers the parser:
+  clean JSON, fenced/prose-wrapped recovery, mood clamping/coercion, missing
+  fields → defaults, non-list tags → `[]`, and malformed → `None`.
+  `backend/conftest.py` puts `backend/` on the path so `import memory` works.
+- **Dep:** added `pytest` (dev) to `requirements.txt`.
+
+### Key decisions
+- **Capture before the model, always.** The save path (vault → DB) runs and is
+  awaited before `ensure_running`; extraction is fire-and-forget afterward. A
+  down or slow model can never cost the user a saved entry. This is the
+  "capture must be real from day one" rule made structural.
+- **Markdown is the source of truth; SQLite is a rebuildable mirror.** Per the
+  memory architecture doc, L0 never depends on the DB. Verified: deleting
+  `eva.db` leaves the journal complete and readable.
+- **Extraction degrades to nulls, never blocks.** Model-unavailable or
+  unparseable output stores `{summary:null, mood:null, entities:[], themes:[]}`
+  rather than retrying forever or failing the turn.
+- **Eva's reply is not yet persisted** — only the user's turns are captured (the
+  journal is the user's words). Storing assistant turns, if wanted, is a later
+  decision.
+
+### Verify
+- Send 3 chat messages → today's `local_vault/journal/<date>.md` contains all 3
+  as timestamped blocks; `entries` has 3 rows and (after a moment) `extractions`
+  has 3 rows with plausible mood/summary.
+- Delete `local_vault/eva.db` → the Markdown is untouched and fully readable.
+- `cd backend && python -m pytest` → 8 passed (parser handles malformed output).
+
+### Left for later phases
+- Extraction quality depends on the live model; with the model down it correctly
+  stores nulls (re-extraction/backfill is a later concern).
+- L2 (embeddings/ChromaDB) and richer L1 fields (events, goals, open loops) are
+  later phases — Phase 2 keeps the schema deliberately tight.
+- The journal UI and the `journal` entry type path land in Phase 3.
+
+---

@@ -7,3 +7,7 @@ uvicorn[standard]==0.34.0
 # poll its readiness. (uvicorn[standard] already provides `websockets`, which
 # powers both the WS /chat server and scripts/ws_test.py — no extra dep needed.)
 httpx==0.28.1
+# Test runner — used for the extraction parser unit tests (`python -m pytest`).
+# A dev dependency, but pinned here so `pip install -r requirements.txt` gives a
+# runnable test suite in one step.
+pytest==8.3.4

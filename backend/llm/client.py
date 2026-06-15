@@ -71,6 +71,51 @@ async def stream_chat(
         raise LlamaUnavailable(f"cannot reach llama-server: {exc}") from exc
 
 
+async def complete_chat(
+    messages: list[dict],
+    *,
+    max_tokens: int = 256,
+    temperature: float | None = None,
+) -> str:
+    """Run a non-streaming chat completion and return the full reply text.
+
+    Streaming is right for chat (words as they arrive) but wrong for extraction,
+    which needs the whole JSON object at once before it can be parsed. This is the
+    one-shot variant: it posts the conversation, waits, and returns
+    ``choices[0].message.content``. ``temperature`` overrides the config default
+    so extraction can run cold (deterministic) while chat stays warm. Raises
+    :class:`LlamaUnavailable` on any transport/HTTP failure so callers treat a
+    down model as "store nulls", never as a crash.
+    """
+    payload = {
+        "model": config.MODEL_REPO,
+        "messages": messages,
+        "stream": False,
+        "temperature": config.TEMPERATURE if temperature is None else temperature,
+        "top_p": config.TOP_P,
+        "top_k": config.TOP_K,
+        "max_tokens": max_tokens,
+    }
+    url = f"{config.endpoint()}/v1/chat/completions"
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as http:
+            resp = await http.post(url, json=payload)
+            if resp.status_code != 200:
+                body = resp.text
+                raise LlamaUnavailable(
+                    f"llama-server returned {resp.status_code}: {body[:200]}"
+                )
+            data = resp.json()
+    except httpx.HTTPError as exc:
+        raise LlamaUnavailable(f"cannot reach llama-server: {exc}") from exc
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise LlamaUnavailable("llama-server returned no choices")
+    return choices[0].get("message", {}).get("content", "") or ""
+
+
 def _parse_sse_line(line: str) -> str | None:
     """Extract the text delta from one server-sent-event line, or ``None``.
 
