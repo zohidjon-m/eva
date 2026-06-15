@@ -180,4 +180,20 @@ by a background extraction — none of which can block or undo the save.
   later phases — Phase 2 keeps the schema deliberately tight.
 - The journal UI and the `journal` entry type path land in Phase 3.
 
+### Post-review hardening (same day)
+Four review findings fixed, all tightening the Phase 2 contract:
+- **L0 write failure is now a hard error.** A failed vault write sends an
+  `error` frame and streams no reply — we never pretend to journal a turn we
+  couldn't save. A DB write failure stays soft (Markdown is the truth): logged,
+  reply proceeds, extraction skipped (no row to attach to).
+- **Extraction is scheduled only after the model is confirmed ready**, so it
+  can't race a cold start, hit `LlamaUnavailable`, and store nulls that never
+  retry. Capture still happens before the model (durability unchanged).
+- **Vault writes are serialized** by a module-level `threading.Lock` (writes run
+  on worker threads via `asyncio.to_thread`), closing the day-file TOCTOU race
+  that could double-write frontmatter or interleave blocks.
+- **L0 stores the user's text verbatim** (dropped `text.strip()`), so the vault
+  and SQLite never diverge — confirmed: with leading/trailing spaces the `.md`
+  block byte-matches `entries.text`.
+
 ---

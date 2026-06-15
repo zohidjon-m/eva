@@ -14,10 +14,18 @@ them.
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 from pathlib import Path
 
 from llm import config
+
+# Serializes day-file writes so two concurrent turns can't both create the
+# frontmatter or interleave their appended blocks. A plain ``threading.Lock``
+# (not ``asyncio.Lock``) because callers run the write on a worker thread via
+# ``asyncio.to_thread``. Capture is rare and the critical section is tiny, so the
+# contention cost is nil — cheap insurance for the L0 source-of-truth format.
+_WRITE_LOCK = threading.Lock()
 
 
 def journal_dir() -> Path:
@@ -54,6 +62,11 @@ def append_entry(
     appended as a timestamped Markdown block — never rewritten, never reordered
     (append-only is what makes L0 trustworthy as the source of truth).
 
+    ``text`` is written verbatim — L0 is the user's unedited words and must match
+    what the derived SQLite store keeps; trimming here would silently diverge the
+    two. (Empty/whitespace-only turns are rejected upstream before they reach
+    capture.)
+
     Returns ``{"date", "time", "timestamp", "type", "path"}`` so the caller can
     mirror the same identity into the derived SQLite store with a single shared
     timestamp. Exists because durable capture must happen before — and
@@ -65,14 +78,18 @@ def append_entry(
 
     path = day_path(date)
     path.parent.mkdir(parents=True, exist_ok=True)
-    is_new_day = not path.exists()
 
+    # Hold the lock across the existence check and both writes: the "is this a new
+    # day?" test and the frontmatter/block writes must be one atomic unit, or two
+    # concurrent turns could double-write the header or interleave blocks.
     # newline="\n" keeps the file plain LF on Windows too, so the Markdown reads
     # identically everywhere and diffs/backups stay clean.
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        if is_new_day:
-            handle.write(f"---\ndate: {date}\n---\n\n# Journal — {date}\n")
-        handle.write(f"\n## {time} · {entry_type}\n\n{text.strip()}\n")
+    with _WRITE_LOCK:
+        is_new_day = not path.exists()
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            if is_new_day:
+                handle.write(f"---\ndate: {date}\n---\n\n# Journal — {date}\n")
+            handle.write(f"\n## {time} · {entry_type}\n\n{text}\n")
 
     return {
         "date": date,

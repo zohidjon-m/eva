@@ -84,25 +84,6 @@ def health() -> dict:
     return server.status()
 
 
-def _capture_turn(text: str) -> int:
-    """Persist one user turn to the vault and the derived DB; return its id.
-
-    Writes L0 Markdown first (the source of truth), then mirrors the same
-    identity into SQLite using the vault's timestamp so the two agree. Runs as one
-    synchronous unit because capture must complete — and survive — regardless of
-    the model: the user's words are safe on disk before any reply is generated.
-    Synchronous on purpose; the caller offloads it to a thread so it never blocks
-    the event loop.
-    """
-    record = vault.append_entry(text, entry_type="chat")
-    return db.insert_entry(
-        date=record["date"],
-        entry_type="chat",
-        text=text,
-        created_at=record["timestamp"],
-    )
-
-
 async def _extract_turn(entry_id: int, text: str) -> None:
     """Run L1 extraction for a saved turn and store it; swallow all failures.
 
@@ -144,13 +125,16 @@ async def chat(websocket: WebSocket) -> None:
     """Stream a single chat reply token-by-token over a WebSocket.
 
     Protocol: the client sends ``{"message": "..."}``; the server first persists
-    the user's turn (vault + DB) and kicks off background extraction, then ensures
-    llama-server is up and emits ``{"type": "token", "text": ...}`` frames as
-    Gemma generates, followed by a final ``{"type": "done"}``. If the model is
+    the user's turn to the vault (L0) — failing the turn hard if that write can't
+    happen — then mirrors it into SQLite, ensures llama-server is up, schedules
+    background extraction, and streams ``{"type": "token", "text": ...}`` frames
+    as Gemma generates, followed by a final ``{"type": "done"}``. If the model is
     unavailable or generation fails, it sends ``{"type": "error", "message",
     "hint"}`` instead of crashing the socket — but the turn is already saved by
-    then, so capture never depends on the model. Exists to prove the streaming
-    spine end-to-end and to make every turn durable from day one.
+    then, so capture never depends on the model. Extraction is scheduled only
+    after the model is confirmed ready, so it can't race a cold start. Exists to
+    prove the streaming spine end-to-end and to make every turn durable from day
+    one.
     """
     await websocket.accept()
     try:
@@ -162,15 +146,35 @@ async def chat(websocket: WebSocket) -> None:
             )
             return
 
-        # Capture first, before anything that can fail on the model side. If
-        # persistence itself fails we log and continue — a storage glitch should
-        # not deny the user a reply — but this is the one thing we try hardest to
-        # do, because an unsaved entry can never be recovered.
+        # Capture L0 first — the source of truth — before anything that can fail
+        # on the model side. A vault write failure is a HARD error: we must not
+        # stream a reply for a turn we couldn't actually save, because an unsaved
+        # entry can never be recovered.
         try:
-            entry_id = await asyncio.to_thread(_capture_turn, user_message)
-            _schedule_extraction(entry_id, user_message)
-        except Exception:  # noqa: BLE001 — never crash the socket on a save error
-            logger.exception("failed to capture chat turn")
+            record = await asyncio.to_thread(
+                vault.append_entry, user_message, entry_type="chat"
+            )
+        except Exception:  # noqa: BLE001 — surface, don't crash the socket
+            logger.exception("failed to write entry to vault (L0)")
+            await websocket.send_json(
+                {"type": "error", "message": "couldn't save your entry", "hint": ""}
+            )
+            return
+
+        # Mirror into SQLite (derived, rebuildable). A DB failure is SOFT —
+        # Markdown is the truth — so log and carry on without an entry id; we
+        # simply can't attach an extraction to a row that doesn't exist.
+        try:
+            entry_id = await asyncio.to_thread(
+                db.insert_entry,
+                date=record["date"],
+                entry_type="chat",
+                text=user_message,
+                created_at=record["timestamp"],
+            )
+        except Exception:  # noqa: BLE001 — DB loss must never deny a reply
+            logger.exception("failed to mirror entry into SQLite")
+            entry_id = None
 
         state = await server.ensure_running()
         if not state.get("ready"):
@@ -182,6 +186,12 @@ async def chat(websocket: WebSocket) -> None:
                 }
             )
             return
+
+        # Only now that the model is confirmed up do we schedule extraction —
+        # scheduling it before ``ensure_running`` could race a cold start, hit
+        # LlamaUnavailable, and store nulls that never get retried.
+        if entry_id is not None:
+            _schedule_extraction(entry_id, user_message)
 
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
