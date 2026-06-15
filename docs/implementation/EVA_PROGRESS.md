@@ -48,6 +48,68 @@ over localhost and shows a live status dot.
 
 ---
 
-## Phase 1 — Model online: streaming chat (backend only) ⏳
+## Phase 1 — Model online: streaming chat (backend only) ✅
 
-Not started.
+**Status:** complete · **Date:** 2026-06-14
+
+Gemma 4 E2B streams tokens through the backend over a WebSocket, proven without
+any UI. The missing-model/binary path degrades gracefully instead of crashing.
+
+### What shipped
+- **`backend/llm/` package** (the app's heart):
+  - `config.py` — single source of truth: ports (llama-server `11500`), the model
+    id (`unsloth/gemma-4-E2B-it-qat-GGUF:UD-Q4_K_XL`), generation params
+    (temp 1.0 / top-p 0.95 / top-k 64), and vault paths. `model_present()` = a
+    `*.gguf` exists under `local_vault/models`; `llama_server_bin()` resolves via
+    `EVA_LLAMA_SERVER_BIN` → vault runtime → `PATH`.
+  - `server.py` — supervises one native `llama-server` child: `status()`,
+    `ensure_running()` (idempotent, polls readiness, never raises), `stop()`.
+    Launched localhost-only and loads the model from a concrete local file with
+    `-m` — no `-hf`/network path is ever invoked, so runtime is offline by
+    construction.
+  - `client.py` — async `stream_chat(messages)` against the OpenAI-compatible
+    endpoint; parses SSE, yields tokens; raises `LlamaUnavailable` on failure.
+- **`backend/app.py`** — real `/health` (delegates to `server.status()`); new
+  `WS /chat` (single-turn streaming with `token` / `done` / `error` frames);
+  lifespan hook warms the model on boot and stops it on shutdown.
+- **Scripts** — `scripts/download_model_win.ps1` (resolves the latest llama.cpp
+  `bin-win-cpu-x64` release, extracts to `local_vault/runtime/`, fetches+verifies
+  the GGUF into `local_vault/models/`; idempotent on the binary step),
+  `download_model_mac.sh` (parity, untested on macOS), `ws_test.py` (sends a
+  message, prints the streamed reply).
+- **Dep:** added `httpx` (websockets already came via `uvicorn[standard]`).
+
+### Key decisions
+- **Native `llama-server`, not Docker.** Docker Desktop is a ~1 GB+ end-user
+  dependency requiring virtualization — wrong for a consumer desktop app and
+  *larger*, not smaller. Native matches the arch doc (§4) and is the Ollama /
+  LM Studio / Jan model: small app, heavy bits fetched on first run, fastest
+  readiness. CPU-only for now (GPU is a later optimization).
+- **Model is downloaded directly, not via `-hf`.** llama.cpp's built-in HF
+  downloader proved flaky on the multi-GB file (repeated "Failed to read
+  connection", ~145 MB in 22 min) and also pulled the multimodal `mmproj`
+  projector we don't need. The scripts now `curl` the one GGUF
+  (`gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf`) directly with resume + retries into
+  `local_vault/models/`, and the server loads it with `-m`.
+- **`.ps1` files must be ASCII** — Windows PowerShell 5.1 reads UTF-8-no-BOM as
+  CP1252, turning em-dashes into stray curly quotes that break parsing.
+- **Privacy:** only the download scripts touch the network; runtime is
+  `--offline` + localhost-bound, no telemetry.
+
+### Verify
+- `powershell scripts\download_model_win.ps1` → binary in `local_vault/runtime/`,
+  `*.gguf` in `local_vault/models/`.
+- Start backend → `curl http://127.0.0.1:8420/health` → `model_present:true,
+  llama_running:true`.
+- `python scripts\ws_test.py "hello"` → a coherent reply streams token-by-token.
+- Rename the `.gguf` away → `/health` flips to `model_present:false` with the
+  download command; `WS /chat` returns a clean `error` frame; no crash.
+
+### Left for later phases
+- `download_model_mac.sh` unverified (no Mac available).
+- No persistence yet — every chat turn is ephemeral (Phase 2 adds the vault).
+- Minimal neutral system prompt inline; the real `eva_system.md` persona is Phase 4.
+- llama.cpp binary is fetched to the vault in dev; bundling it into the installer
+  as a sidecar is Phase 15.
+
+---

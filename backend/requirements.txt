@@ -3,3 +3,7 @@
 # their own deps (llama client, chromadb, faster-whisper, kokoro, ...).
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+# Async HTTP client used to stream tokens from the local llama-server and to
+# poll its readiness. (uvicorn[standard] already provides `websockets`, which
+# powers both the WS /chat server and scripts/ws_test.py — no extra dep needed.)
+httpx==0.28.1
