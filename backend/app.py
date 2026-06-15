@@ -88,13 +88,21 @@ async def _extract_turn(entry_id: int, text: str) -> None:
     """Run L1 extraction for a saved turn and store it; swallow all failures.
 
     Scheduled fire-and-forget after capture so the user never waits on it. It
-    asks the model for ``{summary, mood, entities, themes}`` (storing nulls if the
-    model is down or its output won't parse) and writes the result to SQLite. Any
-    error here is logged and dropped — a failed extraction must never disturb the
-    already-saved entry.
+    first waits for the model to be ready — this is what keeps it from racing a
+    cold start and recording premature nulls. If the model is genuinely
+    unavailable it stores a null extraction rather than leaving the entry with no
+    row at all, so every saved entry ends up with exactly one extraction
+    (possibly null), matching the storage contract. It asks the model for
+    ``{summary, mood, entities, themes}`` (also storing nulls if the output won't
+    parse) and writes the result to SQLite. Any error here is logged and dropped —
+    a failed extraction must never disturb the already-saved entry.
     """
     try:
-        result = await extract.extract(text)
+        state = await server.ensure_running()
+        if state.get("ready"):
+            result = await extract.extract(text)
+        else:
+            result = extract.empty_extraction()  # model down → store nulls, not nothing
         await asyncio.to_thread(
             db.save_extraction,
             entry_id,
@@ -126,15 +134,15 @@ async def chat(websocket: WebSocket) -> None:
 
     Protocol: the client sends ``{"message": "..."}``; the server first persists
     the user's turn to the vault (L0) — failing the turn hard if that write can't
-    happen — then mirrors it into SQLite, ensures llama-server is up, schedules
-    background extraction, and streams ``{"type": "token", "text": ...}`` frames
-    as Gemma generates, followed by a final ``{"type": "done"}``. If the model is
+    happen — then mirrors it into SQLite, schedules background extraction, ensures
+    llama-server is up, and streams ``{"type": "token", "text": ...}`` frames as
+    Gemma generates, followed by a final ``{"type": "done"}``. If the model is
     unavailable or generation fails, it sends ``{"type": "error", "message",
     "hint"}`` instead of crashing the socket — but the turn is already saved by
-    then, so capture never depends on the model. Extraction is scheduled only
-    after the model is confirmed ready, so it can't race a cold start. Exists to
-    prove the streaming spine end-to-end and to make every turn durable from day
-    one.
+    then, so capture never depends on the model. The extraction task waits for the
+    model itself (no cold-start race) and records a null row if it never comes up,
+    so every saved entry gets exactly one extraction. Exists to prove the
+    streaming spine end-to-end and to make every turn durable from day one.
     """
     await websocket.accept()
     try:
@@ -176,6 +184,13 @@ async def chat(websocket: WebSocket) -> None:
             logger.exception("failed to mirror entry into SQLite")
             entry_id = None
 
+        # Kick off extraction now that the entry is saved. The task waits for the
+        # model itself before calling it, so this can't race a cold start, and it
+        # records a null extraction if the model never comes up — every saved
+        # entry gets exactly one row.
+        if entry_id is not None:
+            _schedule_extraction(entry_id, user_message)
+
         state = await server.ensure_running()
         if not state.get("ready"):
             await websocket.send_json(
@@ -186,12 +201,6 @@ async def chat(websocket: WebSocket) -> None:
                 }
             )
             return
-
-        # Only now that the model is confirmed up do we schedule extraction —
-        # scheduling it before ``ensure_running`` could race a cold start, hit
-        # LlamaUnavailable, and store nulls that never get retried.
-        if entry_id is not None:
-            _schedule_extraction(entry_id, user_message)
 
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},

@@ -128,12 +128,13 @@ def parse_extraction(raw: str) -> dict | None:
     }
 
 
-def _empty_extraction() -> dict:
+def empty_extraction() -> dict:
     """Return the all-null extraction stored when the model can't deliver.
 
     Centralizes the "we tried, nothing usable" shape so it matches the parsed
-    shape exactly. Exists because storing nulls (and moving on) is the required
-    fallback — a failed extraction must never cost the user their saved entry.
+    shape exactly. Used both here (parse failure) and by the caller when the model
+    is unavailable, so every saved entry still gets a row — a failed extraction
+    must never cost the user their saved entry.
     """
     return {"summary": None, "mood": None, "entities": [], "themes": []}
 
@@ -175,4 +176,4 @@ async def extract(text: str) -> dict:
         parsed = parse_extraction(raw)
         if parsed is not None:
             return parsed
-    return _empty_extraction()
+    return empty_extraction()

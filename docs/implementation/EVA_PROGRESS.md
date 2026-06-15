@@ -186,9 +186,12 @@ Four review findings fixed, all tightening the Phase 2 contract:
   `error` frame and streams no reply — we never pretend to journal a turn we
   couldn't save. A DB write failure stays soft (Markdown is the truth): logged,
   reply proceeds, extraction skipped (no row to attach to).
-- **Extraction is scheduled only after the model is confirmed ready**, so it
-  can't race a cold start, hit `LlamaUnavailable`, and store nulls that never
-  retry. Capture still happens before the model (durability unchanged).
+- **Extraction owns its own model-readiness.** The background task waits for
+  `ensure_running()` before calling the model, so it can't race a cold start and
+  store premature nulls; if the model never comes up it records a null row rather
+  than leaving the entry with none — every saved entry ends up with exactly one
+  extraction (possibly null). Capture still happens before the model (durability
+  unchanged).
 - **Vault writes are serialized** by a module-level `threading.Lock` (writes run
   on worker threads via `asyncio.to_thread`), closing the day-file TOCTOU race
   that could double-write frontmatter or interleave blocks.
