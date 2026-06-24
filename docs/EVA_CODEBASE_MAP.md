@@ -39,9 +39,11 @@ It runs as **three local processes**:
   loads the Gemma model and generates text. Not a file in the repo — it's a
   binary downloaded into the (gitignored) vault on first run.
 
-**Build status:** Phases 0–3 are complete (scaffold → streaming chat → real
-entry capture → app shell + design system). See
-[`EVA_PROGRESS.md`](implementation/EVA_PROGRESS.md) for the running log.
+**Build status:** Phases 0–2 are complete (scaffold → streaming chat → real
+entry capture), plus **Phase 5** (app shell + design system), which was built
+ahead of Phases 3–4 (L1 full episode schema, L2 semantic index — defined in the
+plan, not yet built). See [`EVA_PROGRESS.md`](implementation/EVA_PROGRESS.md) for
+the running log.
 
 ---
 
@@ -107,7 +109,7 @@ eva/
 │   │   ├── EVA_SYSTEM_DESIGN.md
 │   │   └── EVA_MEMORY_ARCHITECTURE.md
 │   └── implementation/       ← the "when": build plan + progress
-│       ├── EVA_DEMO_IMPLEMENTATION_PLAN.md
+│       ├── IMPLEMENTATION_PLAN_V2.md
 │       └── EVA_PROGRESS.md
 │
 └── local_vault/              ← user data + downloaded model (GITIGNORED, not in repo)
@@ -228,7 +230,7 @@ so the Tauri CLI must be run from the repo root.
 | [`EVA_CODEBASE_MAP.md`](EVA_CODEBASE_MAP.md) | **This file** — what every file does. |
 | [`system/EVA_SYSTEM_DESIGN.md`](system/EVA_SYSTEM_DESIGN.md) | The overall architecture: the three processes, components, data, runtime flows, goals and non-goals. The "why" at the system level. |
 | [`system/EVA_MEMORY_ARCHITECTURE.md`](system/EVA_MEMORY_ARCHITECTURE.md) | The five-layer memory design (L0 vault → L4 analytics) and the rules that keep a small model honest ("code counts, the model narrates"). Essential reading before touching `backend/memory/`. |
-| [`implementation/EVA_DEMO_IMPLEMENTATION_PLAN.md`](implementation/EVA_DEMO_IMPLEMENTATION_PLAN.md) | The phased build plan — what each phase delivers and its acceptance tests. |
+| [`implementation/IMPLEMENTATION_PLAN_V2.md`](implementation/IMPLEMENTATION_PLAN_V2.md) | The phased build plan (v2 — everything real, nothing hardcoded): what each phase delivers and its acceptance tests. |
 | [`implementation/EVA_PROGRESS.md`](implementation/EVA_PROGRESS.md) | A running log of what's actually been built, phase by phase, with key decisions and how to verify each. The source of truth for "where are we." |
 
 ---
@@ -281,6 +283,6 @@ so the Tauri CLI must be run from the repo root.
 
 ---
 
-*This map describes the repository as of Phase 3 (app shell + design system).
-Keep it current: when you add, move, or remove a file, update the matching row
-here.*
+*This map describes the repository as of Phase 5 (app shell + design system),
+built ahead of Phases 3–4. Keep it current: when you add, move, or remove a file,
+update the matching row here.*
