@@ -200,3 +200,75 @@ Four review findings fixed, all tightening the Phase 2 contract:
   block byte-matches `entries.text`.
 
 ---
+
+## Phase 5 — App shell UI + design system ✅
+
+**Status:** complete · **Date:** 2026-06-24
+
+> **Build-order note.** This was built against the v1 plan, where the app shell
+> was Phase 3. Plan v2 (2026-06-24) inserted two capture-substrate phases ahead
+> of the UI — **Phase 3 (L1 full episode schema)** and **Phase 4 (L2 semantic
+> index)** — renumbering the shell to **Phase 5**. Those two phases are now
+> defined and **not yet built**; the shell was completed ahead of them and they
+> are the next work (before Phase 6, the chat surface).
+
+The Phase-0 status-dot placeholder is replaced with the full frame of a product:
+a persistent sidebar, a top bar, a real design-token system, reusable
+primitives, and intentional empty states for all six sections. No feature logic —
+just the shell, built so the app already *looks* finished.
+
+### What shipped
+- **Design tokens** (`ui/src/styles/tokens.css` + `global.css`) — a "warm paper /
+  journal" palette (soft off-white, warm neutrals, terracotta ink accent) with a
+  full dark variant, a type scale, spacing/radii/shadow scales, and base styles.
+  Theme is driven by a `data-theme` attribute on `<html>` (no media-query branch —
+  one code path).
+- **Self-hosted fonts** (`ui/public/fonts/`) — Fraunces (display) + Inter (UI),
+  latin variable woff2 loaded via `@font-face`. No CDN at runtime, so the offline
+  guarantee holds; the family stacks fall back to system fonts if a file is missing.
+- **Theme + health hooks** (`ui/src/lib/`) — `useTheme` (system default + manual
+  toggle, persisted to `localStorage`) and `useBackendHealth` (the Phase-0 `/health`
+  poll, lifted out of `App.tsx` into a hook so the top bar can surface it).
+- **Primitives** (`ui/src/components/`, each `.tsx` + `.module.css`) — `Button`
+  (primary/ghost/subtle), `Input`/`Textarea`, `Card`, `EmptyState`, plus an inline
+  SVG `icons.tsx` set (no icon font/package).
+- **Layout** (`ui/src/components/layout/`) — `AppLayout` (CSS-grid shell owning the
+  active view + theme), `Sidebar` (wordmark + six nav items, active highlight),
+  `TopBar` (section title, visual-only persona selector, "Offline ✓" badge, live
+  status dot, theme toggle). Navigation is a local `View` union — **no router**.
+- **Six section screens** (`ui/src/sections/`) — Chat · Journal · Library · Insights ·
+  Profile · Settings, each a composed empty state with copy true to its real
+  future purpose.
+- **Rewire** — `App.tsx` is now a thin `<AppLayout/>` wrapper; `main.tsx` imports
+  the global stylesheet; the old `App.css` is deleted.
+
+### Key decisions
+- **No new dependencies.** Plain React 19 + Vite + **CSS Modules** (built into
+  Vite) for scoped styles; no router, UI library, or CSS framework — matching the
+  repo's deliberately-tiny-deps ethos. Routing is local state because Eva is a
+  single-window desktop app with a fixed sidebar.
+- **Fonts are bundled, not fetched at runtime.** A CDN font would break the
+  offline guarantee, so the woff2 files ship in the repo (`ui/public/fonts/`).
+- **Aesthetic: warm paper / journal** (chosen with the user) — intimate and
+  analog, like a private notebook.
+- **The persona selector is visual-only** — `POST /persona` is wired with the
+  chat work in Phase 4.
+
+### Verify
+- `cd ui && npm run dev` (or `.\dev.ps1`) → app loads into the new layout, no
+  console errors.
+- Click through all six sections → each renders an intentional empty state; the
+  active nav item highlights and the top-bar title updates.
+- Toggle dark/light → palette flips cleanly and the choice persists across reload.
+- Stop the backend → the top-bar status dot turns red within ~3 s (health poll
+  intact), no crash; "Offline ✓" stays.
+- `cd ui && npm run build` → `tsc` + Vite build pass (47 modules).
+
+### Left for later phases
+- Persona selector and the status dot are presentational/observational only; the
+  real chat surface lands in Phase 6, real persona switching in Phase 9, and the
+  feature screens across Phases 6–19.
+- No responsive collapse of the sidebar yet (the fixed window size makes it
+  unnecessary for now; the top-bar health label hides under 860px).
+
+---

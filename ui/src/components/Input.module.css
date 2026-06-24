@@ -1,0 +1,29 @@
+.field {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-raised);
+  color: var(--ink);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.field::placeholder {
+  color: var(--muted);
+}
+
+.field:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.textarea {
+  resize: vertical;
+  min-height: 4.5rem;
+}

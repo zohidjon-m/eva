@@ -39,9 +39,9 @@ It runs as **three local processes**:
   loads the Gemma model and generates text. Not a file in the repo — it's a
   binary downloaded into the (gitignored) vault on first run.
 
-**Build status:** Phases 0–2 are complete (scaffold → streaming chat → real
-entry capture). See [`EVA_PROGRESS.md`](implementation/EVA_PROGRESS.md) for the
-running log.
+**Build status:** Phases 0–3 are complete (scaffold → streaming chat → real
+entry capture → app shell + design system). See
+[`EVA_PROGRESS.md`](implementation/EVA_PROGRESS.md) for the running log.
 
 ---
 
@@ -78,10 +78,15 @@ eva/
 │
 ├── ui/                       ← Process 1 (frontend half): React + Vite
 │   ├── index.html            ← Vite entry HTML
+│   ├── public/fonts/         ← self-hosted woff2 (Fraunces + Inter) — offline
 │   ├── src/
-│   │   ├── main.tsx          ← React bootstrap (mounts <App/>)
-│   │   ├── App.tsx           ← the current screen: backend status dot
-│   │   ├── App.css           ← styles for that screen
+│   │   ├── main.tsx          ← React bootstrap (mounts <App/>, imports global css)
+│   │   ├── App.tsx           ← thin wrapper that mounts <AppLayout/>
+│   │   ├── styles/           ← design tokens + global base styles
+│   │   ├── lib/              ← useTheme + useBackendHealth hooks
+│   │   ├── components/       ← primitives (Button/Input/Card/EmptyState/icons)
+│   │   │   └── layout/       ← AppLayout, Sidebar, TopBar, nav config
+│   │   ├── sections/         ← the six section screens (empty states)
 │   │   └── vite-env.d.ts     ← Vite type shims
 │   ├── package.json          ← frontend deps + scripts (React 19, Vite)
 │   ├── vite.config.ts        ← Vite config (fixed port 1420 for Tauri)
@@ -172,17 +177,28 @@ rule: **the Markdown is the truth; the database is a rebuildable mirror.**
 
 The React app shown inside the Tauri window. In dev, Vite serves it on port 1420.
 
+Styling is plain **CSS Modules** (built into Vite — no router, UI library, or CSS
+framework). All color/type/spacing comes from the design tokens; nothing
+hard-codes a value. Navigation is local React state (a `View` union), not a router.
+
 | File | What it does | Why it exists |
 |---|---|---|
-| [`src/main.tsx`](../ui/src/main.tsx) | React bootstrap: mounts `<App/>` into the page. | Standard React/Vite entrypoint. |
-| [`src/App.tsx`](../ui/src/App.tsx) | The current screen: Eva's landing view with a status dot that polls the backend's `/health` every 3 s (green = connected, red = unreachable) and shows whether the model is installed. | Proves the shell ↔ backend bridge works. Real chat/journal screens replace this in later phases. |
-| [`src/App.css`](../ui/src/App.css) | Styles for the landing view. | — |
+| [`src/main.tsx`](../ui/src/main.tsx) | React bootstrap: mounts `<App/>` and imports the global stylesheet. | Standard React/Vite entrypoint. |
+| [`src/App.tsx`](../ui/src/App.tsx) | A thin wrapper that renders `<AppLayout/>`. | All screens live inside the layout shell. |
+| [`src/styles/tokens.css`](../ui/src/styles/tokens.css) | The design system as CSS variables: the "warm paper" palette (light) + a `[data-theme="dark"]` override, type/spacing/radii/shadow scales, and `@font-face` for the bundled fonts. | One source of truth for the look; change a token, not a hunt. |
+| [`src/styles/global.css`](../ui/src/styles/global.css) | Base/reset styles (box-sizing, body defaults from tokens, focus ring, scrollbars). Imports `tokens.css`. | The single global stylesheet; everything else is component-scoped. |
+| [`src/lib/useTheme.ts`](../ui/src/lib/useTheme.ts) | Hook: resolves system preference, lets the user toggle light/dark, writes `data-theme` on `<html>`, persists the choice to `localStorage`. | Owns the theme with no dependency. |
+| [`src/lib/useBackendHealth.ts`](../ui/src/lib/useBackendHealth.ts) | Hook: polls `/health` every 3 s → `{health, modelPresent}`. (The Phase-0 logic, lifted out of `App.tsx`.) | Lets the top bar surface the live shell ↔ backend bridge. |
+| [`src/components/`](../ui/src/components/) | Reusable primitives, each `.tsx` + `.module.css`: `Button`, `Input`/`Textarea`, `Card`, `EmptyState`; plus `icons.tsx` (inline SVGs). | The shared UI vocabulary every screen is built from. |
+| [`src/components/layout/`](../ui/src/components/layout/) | The app frame: `AppLayout` (grid shell, owns active view + theme), `Sidebar` (six nav items), `TopBar` (title, persona selector, "Offline ✓", status dot, theme toggle), and `nav.tsx` (the `View` union + nav config that drives all three). | The persistent chrome around every section. |
+| [`src/sections/`](../ui/src/sections/) | The six section screens (Chat · Journal · Library · Insights · Profile · Settings), each an intentional empty state. | The destinations; feature logic fills them in later phases. |
+| [`public/fonts/`](../ui/public/fonts/) | Self-hosted Fraunces + Inter variable woff2 (latin). | Bundled so no font is fetched at runtime — preserves the offline guarantee. |
 | [`src/vite-env.d.ts`](../ui/src/vite-env.d.ts) | TypeScript type shims for Vite. | Editor/compiler support. |
 | [`index.html`](../ui/index.html) | The HTML Vite serves; hosts the React root. | Vite's entry document. |
 | [`package.json`](../ui/package.json) | Frontend dependencies (React 19, Vite, Tauri API/CLI) and scripts (`dev`, `build`, `tauri`). | Defines the frontend toolchain. |
 | [`vite.config.ts`](../ui/vite.config.ts) | Vite config tuned for Tauri: fixed port 1420, don't watch `src-tauri/`, don't clear the screen (so Rust errors stay visible). | Tauri expects the dev server on a fixed port. |
 | `tsconfig.json` / `tsconfig.node.json` | TypeScript compiler settings. | Type-checking the frontend. |
-| `.vscode/extensions.json`, `public/`, `src/assets/` | Editor hints and static assets (logos). | Scaffolding from the Vite/Tauri template. |
+| `.vscode/extensions.json`, `src/assets/` | Editor hints and static assets (logos). | Scaffolding from the Vite/Tauri template. |
 
 ---
 
@@ -265,5 +281,6 @@ so the Tauri CLI must be run from the repo root.
 
 ---
 
-*This map describes the repository as of Phase 2 (real entry capture). Keep it
-current: when you add, move, or remove a file, update the matching row here.*
+*This map describes the repository as of Phase 3 (app shell + design system).
+Keep it current: when you add, move, or remove a file, update the matching row
+here.*

@@ -1,0 +1,15 @@
+.shell {
+  height: 100vh;
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr;
+  grid-template-rows: var(--topbar-height) 1fr;
+  grid-template-areas:
+    "sidebar topbar"
+    "sidebar main";
+}
+
+.main {
+  grid-area: main;
+  overflow-y: auto;
+  background: var(--paper);
+}
