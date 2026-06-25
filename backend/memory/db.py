@@ -1,14 +1,20 @@
-"""Derived SQLite store for entries and their extractions.
+"""Derived SQLite store for entries and their L1 episode records.
 
 This is a *rebuildable mirror* of the L0 vault, not a source of truth: the
 Markdown on disk is authoritative, and this database exists to make the vault
-queryable (full-text search now; mood charts and recall later). Delete the file
-and the user loses nothing — Phase later can re-derive it from the Markdown.
+queryable (full-text search, mood charts, recall, pattern mining). Delete the
+file and the user loses nothing — ``scripts/reextract.py`` re-derives it from the
+Markdown.
 
-Two tables for Phase 2:
-- ``entries``      — one row per captured turn (id, date, type, text, created_at)
-- ``extractions``  — the basic L1 record for an entry (summary, mood, entities,
-  themes), filled in asynchronously after the entry is saved.
+The schema is the full L1 episode record (Memory Architecture §1):
+- ``entries``        — one row per captured turn (id, date, type, text, created_at)
+- ``extractions``    — the 1:1 scalar/summary part of an entry's L1 record
+  (summary, mood, themes, events), filled in asynchronously after the save.
+- Seven 1:many sub-tables keyed to ``entry_id`` hold the structured fields the
+  upper layers reason over: ``emotions``, ``entities``, ``goals``, ``behaviors``,
+  ``decisions``, ``open_loops``, ``self_judgments``. ``behaviors`` is kept
+  structurally distinct from ``goals`` — that separation is the engine of the
+  behavior-vs-goal mistake detection (feature 6).
 
 Plus an FTS5 index over ``entries.text`` so search is fast and offline.
 
@@ -44,9 +50,77 @@ CREATE TABLE IF NOT EXISTS extractions (
     entry_id   INTEGER PRIMARY KEY,
     summary    TEXT,
     mood       INTEGER,
-    entities   TEXT,
     themes     TEXT,
+    events     TEXT,
     created_at TEXT NOT NULL,
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+
+-- Discrete emotions (controlled vocabulary) with 1..5 intensity. One row per
+-- emotion so feature-5 aggregation is plain SQL (COUNT/AVG per emotion).
+CREATE TABLE IF NOT EXISTS emotions (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id  INTEGER NOT NULL,
+    emotion   TEXT NOT NULL,
+    intensity INTEGER,
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+
+-- People / places / projects. ``canonical`` is a deterministic exact-match key
+-- (see extract.canonicalize_entity) so "Tom"/"tom" link now; richer semantic
+-- linking is a later L3 concern.
+CREATE TABLE IF NOT EXISTS entities (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id  INTEGER NOT NULL,
+    raw       TEXT NOT NULL,
+    canonical TEXT,
+    kind      TEXT,
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+
+-- Stated goals/values. Provenance is the row's own ``entry_id`` — the entry
+-- that asserted it.
+CREATE TABLE IF NOT EXISTS goals (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id  INTEGER NOT NULL,
+    statement TEXT NOT NULL,
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+
+-- What the user actually did. Kept distinct from ``goals`` on purpose — the
+-- contradiction between the two is feature 6.
+CREATE TABLE IF NOT EXISTS behaviors (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id  INTEGER NOT NULL,
+    statement TEXT NOT NULL,
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+
+-- Decisions / intentions the user formed in this entry.
+CREATE TABLE IF NOT EXISTS decisions (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id  INTEGER NOT NULL,
+    statement TEXT NOT NULL,
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+
+-- Unresolved threads. New loops are always 'open'; the updated/resolved
+-- timeline is a later nightly-reconciliation phase, not written here.
+CREATE TABLE IF NOT EXISTS open_loops (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id  INTEGER NOT NULL,
+    statement TEXT NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'open',
+    FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+);
+
+-- Self-judgments / regrets — signals for mistake detection. ``kind`` is
+-- 'judgment' or 'regret'.
+CREATE TABLE IF NOT EXISTS self_judgments (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id  INTEGER NOT NULL,
+    statement TEXT NOT NULL,
+    kind      TEXT,
     FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
 
@@ -120,40 +194,99 @@ def insert_entry(*, date: str, entry_type: str, text: str, created_at: str) -> i
         return int(cursor.lastrowid)
 
 
-def save_extraction(
-    entry_id: int,
-    *,
-    summary: str | None,
-    mood: int | None,
-    entities: list | None,
-    themes: list | None,
-    created_at: str,
-) -> None:
-    """Store (or replace) the L1 extraction for an entry.
+# The seven sub-tables whose rows belong to one entry. ``save_extraction``
+# clears these for an entry before re-inserting, so re-extraction is idempotent.
+_SUB_TABLES = (
+    "emotions",
+    "entities",
+    "goals",
+    "behaviors",
+    "decisions",
+    "open_loops",
+    "self_judgments",
+)
 
-    ``entities``/``themes`` are serialized to JSON text — SQLite has no native
-    list type and JSON keeps them readable and trivially re-parsed. Uses
-    ``INSERT OR REPLACE`` keyed on ``entry_id`` so a retry can't create a second
-    row for the same entry. Nulls are valid and expected: extraction stores nulls
-    rather than blocking when the model is unavailable or its output won't parse.
+
+def save_extraction(entry_id: int, *, record: dict, created_at: str) -> None:
+    """Store (or replace) the full L1 episode record for an entry.
+
+    ``record`` is the normalized dict from :func:`memory.extract.parse_extraction`
+    / :func:`memory.extract.empty_extraction` — the single shape every code path
+    produces. The whole record is written in one transaction so an entry never has
+    a half-applied extraction: the scalar part goes to ``extractions`` (themes and
+    events as JSON, since SQLite has no list type and they need no cross-entry
+    keying), and each structured field fans out into its sub-table.
+
+    Idempotency is the point of the delete-then-insert: ``INSERT OR REPLACE`` keeps
+    the ``extractions`` row unique by ``entry_id``, and clearing the sub-tables for
+    this entry before re-inserting means re-running extraction (e.g. the whole
+    ``reextract.py`` rebuild) never doubles a row. Nulls/empty lists are valid and
+    expected — extraction degrades to nulls rather than blocking when the model is
+    unavailable or its output won't parse, so every saved entry still gets exactly
+    one record.
     """
     with closing(_connect()) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO extractions
-                (entry_id, summary, mood, entities, themes, created_at)
+                (entry_id, summary, mood, themes, events, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 entry_id,
-                summary,
-                mood,
-                json.dumps(entities) if entities is not None else None,
-                json.dumps(themes) if themes is not None else None,
+                record.get("summary"),
+                record.get("mood"),
+                json.dumps(record.get("themes") or []),
+                json.dumps(record.get("events") or []),
                 created_at,
             ),
         )
+
+        # Clear any prior sub-rows for this entry so a re-extraction replaces
+        # rather than appends. Foreign keys are ON, but we delete explicitly
+        # because the extractions REPLACE above doesn't cascade to these tables.
+        for table in _SUB_TABLES:
+            conn.execute(f"DELETE FROM {table} WHERE entry_id = ?", (entry_id,))
+
+        conn.executemany(
+            "INSERT INTO emotions (entry_id, emotion, intensity) VALUES (?, ?, ?)",
+            [(entry_id, e["emotion"], e["intensity"]) for e in record.get("emotions") or []],
+        )
+        conn.executemany(
+            "INSERT INTO entities (entry_id, raw, canonical, kind) VALUES (?, ?, ?, ?)",
+            [
+                (entry_id, e["raw"], e["canonical"], e["kind"])
+                for e in record.get("entities") or []
+            ],
+        )
+        for table in ("goals", "behaviors", "decisions"):
+            conn.executemany(
+                f"INSERT INTO {table} (entry_id, statement) VALUES (?, ?)",
+                [(entry_id, s) for s in record.get(table) or []],
+            )
+        conn.executemany(
+            "INSERT INTO open_loops (entry_id, statement, status) VALUES (?, ?, ?)",
+            [(entry_id, loop["statement"], loop["status"]) for loop in record.get("open_loops") or []],
+        )
+        conn.executemany(
+            "INSERT INTO self_judgments (entry_id, statement, kind) VALUES (?, ?, ?)",
+            [
+                (entry_id, j["statement"], j["kind"])
+                for j in record.get("self_judgments") or []
+            ],
+        )
         conn.commit()
+
+
+def count_rows(table: str) -> int:
+    """Return the number of rows in one table — a tiny helper for rebuild checks.
+
+    Exists so ``reextract.py`` and the tests can assert "counts match" after a
+    rebuild without each re-implementing a COUNT query. ``table`` is an internal,
+    code-supplied name (never user input), so the f-string interpolation is safe.
+    """
+    with closing(_connect()) as conn:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
 def search(query: str, *, limit: int = 20) -> list[sqlite3.Row]:

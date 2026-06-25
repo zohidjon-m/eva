@@ -14,11 +14,19 @@ them.
 
 from __future__ import annotations
 
+import re
 import threading
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 
 from llm import config
+
+# Matches one entry's header line, e.g. ``## 14:03:27 · chat``. The writer in
+# ``append_entry`` produces exactly this shape, so parsing splits the day-file
+# back into blocks on it. A user line that merely starts with ``##`` won't match
+# (it lacks the ``HH:MM:SS · type`` form), so prose is not mistaken for a header.
+_BLOCK_HEADER = re.compile(r"^## (\d{2}:\d{2}:\d{2}) · (\S+)$")
 
 # Serializes day-file writes so two concurrent turns can't both create the
 # frontmatter or interleave their appended blocks. A plain ``threading.Lock``
@@ -98,3 +106,61 @@ def append_entry(
         "type": entry_type,
         "path": str(path),
     }
+
+
+def parse_day_file(path: Path) -> list[dict]:
+    """Parse one day-file back into its list of entry blocks, in file order.
+
+    The inverse of :func:`append_entry`'s write: it splits the Markdown on the
+    ``## HH:MM:SS · type`` block headers and returns one
+    ``{date, time, type, text, timestamp}`` per block. Frontmatter and the
+    ``# Journal —`` title (everything before the first block header) are skipped.
+    The structural blank lines the writer wraps each block in are stripped, while
+    blank lines *inside* a multi-paragraph entry are preserved (an internal blank
+    line is followed by more text, not by a header). Read-only — it never touches
+    the file. Exists so derived layers (re-extraction, re-indexing, the journal
+    UI) can read L0 back through one shared parser instead of re-implementing it.
+    """
+    date = path.stem
+    lines = path.read_text(encoding="utf-8").split("\n")
+    headers = [i for i, line in enumerate(lines) if _BLOCK_HEADER.match(line)]
+
+    entries: list[dict] = []
+    for index, start in enumerate(headers):
+        match = _BLOCK_HEADER.match(lines[start])
+        assert match is not None  # start came from a match above
+        time, entry_type = match.group(1), match.group(2)
+
+        end = headers[index + 1] if index + 1 < len(headers) else len(lines)
+        body = lines[start + 1 : end]
+        while body and not body[0].strip():  # drop the blank line after the header
+            body.pop(0)
+        while body and not body[-1].strip():  # drop the trailing/separator blank line
+            body.pop()
+
+        entries.append(
+            {
+                "date": date,
+                "time": time,
+                "type": entry_type,
+                "text": "\n".join(body),
+                "timestamp": f"{date}T{time}",
+            }
+        )
+    return entries
+
+
+def iter_entries() -> Iterator[dict]:
+    """Yield every captured entry across all day-files, in chronological order.
+
+    Walks ``local_vault/journal/*.md`` sorted by name (which, being
+    ``YYYY-MM-DD``, sorts by date) and yields each block from
+    :func:`parse_day_file`. This is the full read of L0 that ``reextract.py`` uses
+    to rebuild the derived database from the source of truth. Yields nothing (not
+    an error) when no journal exists yet, so callers can iterate unconditionally.
+    """
+    directory = journal_dir()
+    if not directory.is_dir():
+        return
+    for path in sorted(directory.glob("*.md")):
+        yield from parse_day_file(path)

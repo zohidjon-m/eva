@@ -90,12 +90,12 @@ async def _extract_turn(entry_id: int, text: str) -> None:
     Scheduled fire-and-forget after capture so the user never waits on it. It
     first waits for the model to be ready — this is what keeps it from racing a
     cold start and recording premature nulls. If the model is genuinely
-    unavailable it stores a null extraction rather than leaving the entry with no
-    row at all, so every saved entry ends up with exactly one extraction
-    (possibly null), matching the storage contract. It asks the model for
-    ``{summary, mood, entities, themes}`` (also storing nulls if the output won't
-    parse) and writes the result to SQLite. Any error here is logged and dropped —
-    a failed extraction must never disturb the already-saved entry.
+    unavailable it stores an empty extraction rather than leaving the entry with no
+    row at all, so every saved entry ends up with exactly one episode record
+    (possibly null), matching the storage contract. It asks the model for the full
+    L1 record (also storing the empty record if the output won't parse) and writes
+    the result to SQLite. Any error here is logged and dropped — a failed
+    extraction must never disturb the already-saved entry.
     """
     try:
         state = await server.ensure_running()
@@ -106,10 +106,7 @@ async def _extract_turn(entry_id: int, text: str) -> None:
         await asyncio.to_thread(
             db.save_extraction,
             entry_id,
-            summary=result["summary"],
-            mood=result["mood"],
-            entities=result["entities"],
-            themes=result["themes"],
+            record=result,
             created_at=datetime.now().isoformat(timespec="seconds"),
         )
     except Exception:  # noqa: BLE001 — background task must never propagate

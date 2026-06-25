@@ -201,6 +201,100 @@ Four review findings fixed, all tightening the Phase 2 contract:
 
 ---
 
+## Phase 3 — L1: full episode schema (+ re-extraction backfill) ✅
+
+**Status:** complete · **Date:** 2026-06-25
+
+The L1 extraction grew from Phase 2's tight `{summary, mood, entities, themes}`
+to the full Memory Architecture §1 episode record, normalized into sub-tables, and
+a rebuild script proves the whole database re-derives from the Markdown. Backend
+only — no UI (the journaling surface is Phase 7).
+
+### What shipped
+- **`backend/memory/db.py`** — revised schema. `extractions` is now the 1:1
+  scalar/summary row (`summary`, `mood`, `themes` JSON, `events` JSON,
+  `created_at`); the Phase-2 `entities` JSON column is gone. Seven 1:many
+  sub-tables keyed to `entry_id` with `ON DELETE CASCADE`: `emotions`
+  (emotion + 1..5 intensity), `entities` (raw/canonical/kind), `goals`,
+  `behaviors`, `decisions`, `open_loops` (statement + status, default `'open'`),
+  `self_judgments` (statement + judgment|regret). `save_extraction(entry_id, *,
+  record, created_at)` takes the whole record and writes it in **one
+  transaction**, clearing an entry's sub-rows before re-inserting so a
+  re-extraction **replaces rather than doubles** (idempotent). Added
+  `count_rows(table)` for rebuild checks.
+- **`backend/memory/extract.py`** — expanded prompt + parser to the full JSON
+  contract in **one bounded, low-temperature call** with a single richly-populated
+  few-shot example (the schema-degradation guard, §5.6: held by example quality,
+  not retries; `max_tokens` 256→512). A fixed **controlled emotion vocabulary**
+  (`EMOTION_SET`, 15 emotions) — out-of-set emotions are dropped so feature-5
+  aggregation sees a closed vocabulary. `canonicalize_entity()` produces a
+  deterministic exact-match key (casefold/trim/collapse/strip-punct) so "Tom"/
+  "tom"/"Tom." link now (semantic "my brother"⇒"Tom" linking is later L3 work).
+  Every field is normalized by its own defensive coercer, so one malformed field
+  degrades to a safe default instead of sinking the extraction; total parse
+  failure still → retry-once → empty record. `empty_extraction()` updated to the
+  full shape.
+- **`backend/memory/vault.py`** — new L0 *reader*, symmetric with `append_entry`:
+  `parse_day_file(path)` and `iter_entries()` split each day-file back into
+  `{date, time, type, text, timestamp}` blocks on the `## HH:MM:SS · type` header
+  (frontmatter/title skipped; blank lines *inside* an entry preserved).
+  Read-only — never mutates L0. The shared reader reextract/reindex/journal-UI
+  build on.
+- **`scripts/reextract.py`** — deletes the derived `eva.db`, recreates the schema,
+  ensures the model is up, and replays `vault.iter_entries()` through real
+  extraction into the fresh DB, printing per-table counts. **L0 is read-only;
+  only the rebuildable DB is replaced.** This is also the upgrade/migration tool.
+- **`backend/app.py`** — `_extract_turn` now calls
+  `db.save_extraction(entry_id, record=result, …)`; capture/durability unchanged.
+- **Tests** — `tests/test_extract.py` rewritten to the new contract with per-field
+  defensive cases (emotions out-of-set/bad-intensity/non-object, entity
+  kind-validation/canonicalization, statement lists skipping non-strings,
+  open-loop default-open, self-judgment object-or-string) plus a vault
+  round-trip; new `tests/test_db.py` covers the sub-table fan-out, the
+  goal-vs-behavior separation, idempotency, the empty-record path, and cascade
+  delete. **24 passed.**
+
+### Key decisions
+- **Controlled emotion vocabulary, drop out-of-set** (chosen with the user) — a
+  closed set keeps feature-5 time-series aggregatable; invented emotions are
+  dropped, never stored.
+- **Upgrade = reextract-rebuild, no ALTER migration** (chosen with the user) —
+  the DB is derived and rebuildable, so the schema change is handled by deleting
+  and rebuilding from L0, not by in-place migration.
+- **Goals and behaviors are separate tables** — the structural separation is the
+  engine of feature 6 (a stated goal vs. a contradicting behavior).
+- **`themes`/`events` stay JSON on `extractions`** — simple tag-like lists with no
+  cross-entry keying need this phase; still captured from day one and
+  re-normalizable later. `entities` got its own table because it needs the
+  canonical link key.
+- **Open loops are captured as `'open'` only** — the updated/resolved timeline is
+  a later nightly-reconciliation phase, deliberately not built here.
+
+### Verify
+- `cd backend && python -m pytest` → **24 passed** (parser per-field paths, DB
+  fan-out + idempotency + cascade, vault round-trip).
+- **Live e2e (model running):** send 5 varied chat turns (a vent, a goal
+  statement, an unresolved argument, a decision, a regret) → each entry gets an
+  `extractions` row and rows in the right sub-tables; an open loop is `'open'`; a
+  stated goal and a contradicting behavior are separate rows; emotions are
+  in-vocabulary with 1..5 intensity; entities have a populated `canonical`.
+- **Rebuild proof:** `del local_vault\eva.db && python scripts\reextract.py` →
+  every field rebuilds from the Markdown and counts match the live run; the
+  journal `.md` files are byte-identical (L0 untouched).
+
+### Left for later phases / notes
+- **Upgrade action required once:** any pre-Phase-3 `local_vault/eva.db` has the
+  old `extractions` schema (no `events` column) and must be rebuilt — run
+  `python scripts/reextract.py` (or delete the empty derived DB) before the next
+  capture, or the first save fails on the missing column.
+- Open-loop reconciliation/timeline (nightly), semantic entity linking (L3), L2
+  embeddings (Phase 4), and the journaling UI + `journal` capture path (Phase 7)
+  are out of scope here.
+- A complete `reextract.py` rebuild needs the model up; with it down, every field
+  stores null (same contract as live capture).
+
+---
+
 ## Phase 5 — App shell UI + design system ✅
 
 **Status:** complete · **Date:** 2026-06-24
