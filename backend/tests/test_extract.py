@@ -191,3 +191,46 @@ def test_vault_round_trips_entries(tmp_path, monkeypatch):
     ]
     assert [e["type"] for e in entries] == ["chat", "journal", "chat"]
     assert all(e["date"] == a["date"] == b["date"] == c["date"] for e in entries)
+
+    # Phase 3.5: every entry carries the stable uid minted at append time, the
+    # same one the writer returned, and they are distinct per entry.
+    assert [e["uid"] for e in entries] == [a["uid"], b["uid"], c["uid"]]
+    assert all(e["uid"] for e in entries)
+    assert len({e["uid"] for e in entries}) == 3
+
+
+# --- Phase 3.5: stable uid + content hash ------------------------------------
+
+def test_uid_is_written_into_the_header_and_round_trips(tmp_path, monkeypatch):
+    # The uid lives in L0 itself, so re-reading the file recovers the exact uid the
+    # writer minted — this is what lets a rebuild preserve identity.
+    monkeypatch.setenv("EVA_VAULT_DIR", str(tmp_path))
+    written = vault.append_entry("hello", entry_type="journal")
+
+    day_file = vault.day_path(written["date"])
+    assert f"· journal · {written['uid']}" in day_file.read_text(encoding="utf-8")
+    assert vault.parse_day_file(day_file)[0]["uid"] == written["uid"]
+
+
+def test_legacy_header_without_uid_parses_as_none(tmp_path, monkeypatch):
+    # A pre-3.5 day-file (no uid in the header) must still parse — it comes back
+    # with uid=None so the migration can stamp it, rather than failing to read.
+    monkeypatch.setenv("EVA_VAULT_DIR", str(tmp_path))
+    day_file = vault.day_path("2026-06-01")
+    day_file.parent.mkdir(parents=True, exist_ok=True)
+    day_file.write_text(
+        "---\ndate: 2026-06-01\n---\n\n# Journal — 2026-06-01\n"
+        "\n## 09:00:00 · chat\n\nan old entry\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    parsed = vault.parse_day_file(day_file)
+    assert len(parsed) == 1
+    assert parsed[0]["uid"] is None
+    assert parsed[0]["text"] == "an old entry"
+
+
+def test_content_hash_is_stable_and_text_sensitive():
+    assert vault.content_hash("same") == vault.content_hash("same")
+    assert vault.content_hash("before") != vault.content_hash("after")

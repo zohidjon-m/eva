@@ -66,10 +66,12 @@ Rules:
 | 1 | Model online: streaming chat (backend only) | A — Spine | Proves gemma4 works before any UI |
 | 2 | Vault: real entry capture (L0 + basic L1) | A — Spine | Capture must be real from day one |
 | 3 | L1: full episode schema (+ re-extraction backfill) | B — Capture substrate | The moat can only reflect what was captured at write time |
+| 3.5 | Stable entry identity (`uid`) + content-hash dirty-tracking | B — Capture substrate | Editing *and* durable evidence pointers both require it; cheapest before entries pile up ([ADR-001](../decisions/ADR-001-editable-entries.md)) |
 | 4 | Semantic index (L2): embeddings + ChromaDB | B — Capture substrate | Recall, clustering, edge candidates all sit on this |
 | 5 | App shell UI + design system | C — Surfaces | "Really good UI" starts here, not as an afterthought |
 | 6 | Chat surface (streaming, polished) | C — Surfaces | The core demo interaction |
 | 7 | Journaling surface (separate from chat) | C — Surfaces | Second pillar of the experience |
+| 7.5 | Editable entries (L0 revisions + single-entry recompute) | C — Surfaces | Edits must propagate L0→L4 without a full rebuild ([ADR-001](../decisions/ADR-001-editable-entries.md)) |
 | 8 | Library: upload books / PDFs / text | C — Surfaces | First half of the RAG story |
 | 9 | Conversation engine: intent classifier + listen-first gating + personas | D — Talking, for real | Listen-first is structural, not a prompt plea |
 | 10 | Grounded answers with citations (advice-mode RAG) | D — Talking, for real | The strongest real proof of the thesis |
@@ -143,6 +145,20 @@ Milestone A = it runs. ▸ B = capture is complete. ▸ C = the product surfaces
 - Delete `eva.db`, run `reextract.py` → every field rebuilds from the Markdown; counts match. Unit tests cover each new field's parser path (missing/malformed → null, never crash).
 **Done when:** every entry yields the full episode record, and the whole DB rebuilds from L0. Commit.
 
+### Phase 3.5 — Stable entry identity (`uid`) + content-hash dirty-tracking ✅ *(complete)*
+**Goal:** give every entry a stable, content-independent identity and track what each derived row was computed from — the foundation that makes editing safe *and* fixes a latent bug today.
+**Why now:** two things break the moment entries can change or the DB rebuilds. (1) Today entries are keyed by autoincrement `entries.id`, which `reextract.py` **reassigns on every rebuild** — so any L3 evidence pointer (Phase 13, *no pointer no claim*) would silently point at the wrong entry after a rebuild. (2) Editing (Phase 7.5) needs to address one entry and recompute only it. A stable `uid` solves both, and it must land **before L2 (Phase 4) keys off entry identity and before the surfaces generate the bulk of entries** — retrofitting ids onto a full vault is far worse than doing it now. This is Action Item 1 of [ADR-001](../decisions/ADR-001-editable-entries.md) and is worth landing *even if editing were never built*.
+**Build:**
+- **Stable `uid` in L0.** Assign each entry a content-independent id at append time (ULID or 8-char random hex) and write it into the block header — e.g. `## 14:03:27 · journal · a1b2c3` (extend `_BLOCK_HEADER` + `parse_day_file` in `vault.py`). The `uid` never derives from the text, so editing the text never changes it.
+- **One-time backfill migration** stamps `uid`s into existing day-files (a deliberate, logged, one-time rewrite — append-only purity holds *going forward*). Few entries exist now; this is the cheap moment.
+- **Derived layers key off `uid`, not rowid.** Add `uid` to `entries` (unique) and make L1 sub-tables / future L2 / L3 evidence pointers reference `uid`. Re-extraction and rebuild must **preserve `uid`** so pointers survive (`reextract.py` reads the `uid` from L0 rather than minting a new id).
+- **Content hash per entry.** Store `source_hash` (hash of the L0 block text) on the `extractions` row. `reextract.py` becomes **hash-gated/incremental**: only re-extract entries whose `source_hash` changed — the same mechanism Phase 7.5 uses to recompute a single edited entry.
+**Read these:** `vault.py` (the `uid` in the header + parser), `db.py` (the `uid`/`source_hash` columns), `scripts/reextract.py` (uid-preserving, hash-gated rebuild).
+**Test:**
+- Append entries → each gets a unique `uid` in the Markdown and the DB. Delete `eva.db`, run `reextract.py` → **every `uid` is identical to before** (pointer stability proven); unchanged entries are skipped by the hash gate, counts still match.
+- The backfill migration run twice is idempotent (no duplicate ids, no double-rewrite).
+**Done when:** every entry has a durable `uid` that survives a full rebuild, and rebuild only touches changed entries. Commit.
+
 ### Phase 4 — Semantic index (L2): embeddings + ChromaDB
 **Goal:** real associative recall and the candidate-generation substrate for clustering and graph edges.
 **Build:**
@@ -188,6 +204,23 @@ Milestone A = it runs. ▸ B = capture is complete. ▸ C = the product surfaces
 **Read these:** the journal screen, the save path in `vault.py` (chat vs journal types).
 **Test:** write & save → appears in the day file, the list, gets a full extraction; acknowledgment is appropriate in tone. Reopen the app → draft/entry persists; an older hand-placed file renders correctly.
 **Done when:** journaling works end-to-end and feels distinct from chat. Commit.
+
+### Phase 7.5 — Editable entries (L0 revisions + single-entry recompute)
+**Goal:** let the user fix a typo or reword *any* past entry, and have the whole stack stay correct — without a full rebuild and without losing the original.
+**Why now:** the journal browse list (Phase 7) is where an edit affordance belongs, and by here L1 (Phase 3), `uid`/hash (Phase 3.5), and L2 (Phase 4) all exist, so a single-entry recompute is cheap and real. This implements Action Items 2–3 and 5 of [ADR-001](../decisions/ADR-001-editable-entries.md). (L3 doesn't exist until Phase 13, so the L3 self-heal hook is added there — see below; an edit before then correctly recomputes L1/L2/L4.)
+**Build:**
+- **L0 stays append-only — edits are revisions, not rewrites.** `vault.py` gains `update_entry(uid, new_text)`: the prior version is preserved (in `journal/.history/` or as a superseded block) and the current text is the latest revision. *"Never rewritten" stays literally true*, and the original survives for time-travel (feature 8).
+- **Atomic write.** The day-file rewrite goes through a temp file + atomic rename under the existing `_WRITE_LOCK`, so a failed edit can never corrupt the one irreplaceable store (`append_entry` couldn't corrupt prior data; a block rewrite must be just as safe).
+- **Single-entry recompute (the fast, synchronous path).** `recompute_entry(uid)`: `source_hash` changes → re-extract just that entry (one model call, reuses the idempotent `save_extraction`) → re-embed L2 (idempotent upsert) → L4 needs nothing (computed on demand). What the user sees is immediately correct; cost is one extraction + one embedding.
+- **Endpoint + UI.** `PUT /entries/{uid}` → vault revision + `recompute_entry`. In the Phase 7 browse view: an edit affordance on an entry, and a "show original" toggle when an entry has prior revisions.
+- **Deletion is the same machinery** (edit-to-tombstone → dirty → cascade-drop L1 rows → L2 removed).
+- **Doc amendment (Action Item 6):** update `EVA_MEMORY_ARCHITECTURE.md` §L0 and `EVA_SYSTEM_DESIGN.md` recovery section — "append-only" → "append-only *storage* with editable *presentation* via revisions."
+**Read these:** `vault.py` (`update_entry` + atomic rewrite + history), `recompute_entry` (the per-entry re-extract/re-embed), the `PUT /entries/{uid}` handler.
+**Test:**
+- Edit a past entry's text → its L1 record, FTS, and L2 embedding all reflect the new text; **its `uid` and evidence-pointer identity are unchanged**; the original is still retrievable.
+- Fix a one-character typo → exactly one entry is re-extracted (the hash gate skips all others); an interrupted/failed rewrite leaves the day-file intact (atomicity proven).
+- Edit-to-empty (delete) → L1 sub-rows cascade-drop and the L2 vectors are gone; no orphan rows.
+**Done when:** any entry is editable, edits propagate L0→L2/L4 by recomputing only that entry, and the original is never lost. Commit.
 
 ### Phase 8 — Library: upload books / PDFs / text
 **Goal:** the user can hand Eva their books; the corpus pipeline is real.
@@ -251,7 +284,8 @@ Milestone A = it runs. ▸ B = capture is complete. ▸ C = the product surfaces
 **Goal:** the evolving model of *who the user is* — the moat — built for real. This is the hardest single component (Memory Architecture §6); design it explicitly before building on it.
 **Build:**
 - `backend/memory/profile.py` with the real interface from System Design §5.8: `retrieve_slices(topic) -> fragments`, `apply_ops(ops)`, `get_profile()`.
-- **Claim data structure** (SQLite/JSON): `{id, statement, type (identity|goal|pattern|relationship|baseline|open_loop|watch_item), evidence_pointers:[entry_id…], confidence, first_seen, last_seen, status, source (model|user)}`. **No evidence pointer → claim rejected by code** (Memory Architecture §5.1). The `watch_item` type holds candidate recurring mistakes tied to goals (the feature-6 precursor).
+- **Claim data structure** (SQLite/JSON): `{id, statement, type (identity|goal|pattern|relationship|baseline|open_loop|watch_item), evidence_pointers:[uid…], confidence, first_seen, last_seen, status, source (model|user), needs_revalidation}`. Evidence pointers are entry **`uid`s** (Phase 3.5) so they survive rebuilds and entry edits. **No evidence pointer → claim rejected by code** (Memory Architecture §5.1). The `watch_item` type holds candidate recurring mistakes tied to goals (the feature-6 precursor). `needs_revalidation` is the edit self-heal flag — see below.
+- **Edit self-heal hook** ([ADR-001](../decisions/ADR-001-editable-entries.md) Action Item 4): when an entry is edited (Phase 7.5), code flags every claim whose `evidence_pointers` include that `uid` as `needs_revalidation = true`. The claim is *not* rebuilt synchronously; it is revalidated on the next consolidation (Phase 14). This keeps an edit cheap while the moat self-heals on its normal cadence.
 - **Operation grammar** the model is allowed to emit — a small fixed set: `add` / `strengthen` / `weaken` / `note-contradiction` / `mark-resolved` / `link-evidence`. Each operation carries its evidence pointer. The model emits operations over a *bounded* slice of L3 (only the sections today's facts touch); it never regenerates the profile.
 - **Deterministic apply + decay + contradiction-resolution** (pure Python, fully audited): apply validates evidence and updates confidence; **confidence rises with corroboration and fades without it** (Memory Architecture §5.4) so one-off remarks never harden into "facts"; contradiction resolution reconciles conflicting claims by recency/evidence/source.
 - **Two stores:** structured `profile.json` (the machine's), and a human-readable `profile.md` narrative regenerated from the structured claims. **User edits to `profile.md` become `source: user` anchors the model may not overwrite** (Memory Architecture §5.8).
@@ -268,7 +302,7 @@ Milestone A = it runs. ▸ B = capture is complete. ▸ C = the product surfaces
 **Build:**
 - `backend/memory/consolidate.py` with `on_save(entry_id)`, `run_nightly()`, `run_weekly()`:
   - **On save:** L0 append → L1 extract → L2 embed (already wired Phases 2–4) → queue downstream. One small model call total.
-  - **Nightly (today only):** (1) append today's mood/emotion/metrics to SQLite — *no model*. (2) Reconcile open loops: embedding-match today's content vs currently-open loops, then a tiny yes/no model check ("same unresolved thing?") to mark resolved/updated/new. (3) Update L3 via bounded **operations** with evidence pointers (Phase 13 `apply_ops`) — never a rewrite.
+  - **Nightly (today only):** (1) append today's mood/emotion/metrics to SQLite — *no model*. (2) Reconcile open loops: embedding-match today's content vs currently-open loops, then a tiny yes/no model check ("same unresolved thing?") to mark resolved/updated/new. (3) Update L3 via bounded **operations** with evidence pointers (Phase 13 `apply_ops`) — never a rewrite. (4) **Revalidate edited claims** ([ADR-001](../decisions/ADR-001-editable-entries.md)): for every claim flagged `needs_revalidation` (an entry it cites was edited via Phase 7.5), re-pull its now-updated cited entries and run the cheap verification pass (Phase 19 / Memory Architecture §5.7, "supported by its evidence? yes/no"); claims that lost support decay or drop (§5.4), claims still supported clear the flag. No replay, no full rebuild.
   - **Weekly (the reduce step — features 6 & 9):** (1) **Deterministic mining first** — code counts theme frequencies, emotion co-occurrence, open-loop recurrence, and **behavior-vs-goal contradictions** (a recurring behavior running against a stated goal) → ranked candidates *with evidence counts*. (2) Cluster similar episodes (L2 embeddings). (3) **Narrate** — only now the model describes the top-few candidates strictly from the provided evidence. (4) Reconcile L3 (merge, decay, resolve). (5) Rebuild the graph + roll up digests.
   - **Rollup hierarchy:** entries → week digests → month digests → "era" digests, each a map-reduce of the level below, so no model call ever sees more than one bounded window (Memory Architecture §3, §5.5).
 - `backend/scheduler.py` (APScheduler): runs nightly/weekly when idle; **defers jobs while a chat turn is active** and **serializes model access** so background work never contends with the real-time path (System Design §8). Plus a manual `POST /consolidate?scope=nightly|weekly` trigger for testing only.

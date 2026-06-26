@@ -295,6 +295,74 @@ only — no UI (the journaling surface is Phase 7).
 
 ---
 
+## Phase 3.5 — Stable entry identity (`uid`) + content-hash dirty-tracking ✅
+
+**Status:** complete · **Date:** 2026-06-26 · **Design:** [ADR-001](../decisions/ADR-001-editable-entries.md)
+
+Gave every entry a stable, content-independent `uid` minted in L0 at write time and
+a `source_hash` recording the text each extraction was derived from. This is the
+foundation for editable entries (Phase 7.5) **and** fixes a latent bug: before this,
+`reextract.py` reassigned autoincrement ids on every rebuild, so any future L3
+evidence pointer would have silently pointed at the wrong entry after a rebuild.
+Backend only.
+
+### What shipped
+- **`backend/memory/vault.py`** — `new_uid()` (8 hex chars via stdlib `secrets`) and
+  `content_hash()` (truncated SHA-256). `append_entry` now mints a uid and writes
+  the header as `## HH:MM:SS · type · uid`, returning `uid` in its metadata. The
+  `_BLOCK_HEADER` regex gained an **optional** uid group so legacy day-files still
+  parse (uid `None`); `parse_day_file`/`iter_entries` surface `uid` per block.
+- **`backend/memory/db.py`** — `entries.uid TEXT UNIQUE` and `extractions.source_hash`.
+  New `insert_entry(uid=…)`, `upsert_entry()` (identity-preserving write keyed on
+  uid — a rebuild reuses the row instead of minting a new id), `entry_id_for_uid()`,
+  `source_hash_for()`, `schema_is_current()`, and `reset_db()`. `save_extraction`
+  takes `source_hash`, stamped **only for a real model-backed extraction** (null
+  record ⇒ hash left `None` so the next rebuild re-extracts it).
+- **`scripts/reextract.py`** — rewritten to be **uid-preserving and hash-gated**:
+  migrates a stale (pre-3.5) schema once via `reset_db()`, upserts each entry by its
+  L0 `uid`, and **skips entries whose text is unchanged** since their last
+  model-backed extraction. Refuses entries with no uid (directs to `migrate_uids.py`).
+- **`scripts/migrate_uids.py`** (new) — one-time backfill that stamps `· uid` into
+  legacy headers: body-preserving (header lines only), idempotent (a uid'd header no
+  longer matches), atomic per file (temp + `os.replace`). The single deliberate L0
+  rewrite the append-only contract permits.
+- **`backend/app.py`** — live capture passes `uid=record["uid"]` into `insert_entry`
+  and the real-extraction `source_hash` into `save_extraction`.
+- **Tests** — +7 (24 → **31 passing**): uid round-trips through the header, legacy
+  header parses as `uid=None`, `content_hash` stable/text-sensitive; DB schema check,
+  uid insert+lookup, upsert reuses the row, source_hash round-trip + model-down gate.
+
+### Key decisions
+- **8-char random hex for `uid`** (zero-dependency `secrets`, vs. ULID) — sortability
+  isn't needed (entries already order by date+time); the offline/no-deps contract wins.
+- **`uid` lives in L0, not just the DB** — identity has to survive a full rebuild, so
+  it must be in the source of truth. The DB row id stays the internal FK key; `uid` is
+  the external identity upper layers reference.
+- **Hash stamped only on real extractions** — a model-down null record leaves
+  `source_hash` `None` so it's never mistaken for up-to-date and is re-extracted later.
+- **Upgrade = rebuild, no ALTER** (continues the Phase 3 policy) — `schema_is_current()`
+  detects the missing `uid` column and `reset_db()` rebuilds fresh from L0.
+
+### Verify
+- `cd backend && python -m pytest` → **31 passed**.
+- **uid stability + idempotency (no model):** append entries → uids in L0; two
+  `upsert`-based rebuild passes keep `entries` at the same count with **identical row
+  ids** and uids preserved from L0. A legacy day-file stamps once then no-ops, uid
+  appears, body byte-intact.
+- **Live/rebuild (model up):** `python scripts/reextract.py` extracts changed entries
+  and prints `[skip]` for unchanged ones; a second run skips everything.
+
+### Left for later phases / notes
+- **Upgrade action required once:** an existing pre-3.5 `local_vault/` should run
+  `python scripts/migrate_uids.py` then `python scripts/reextract.py` (the rebuild
+  also auto-migrates the DB schema). Day-files captured *after* this phase already
+  carry uids.
+- L2 (Phase 4) and L3 (Phase 13) will key their metadata / evidence pointers on `uid`.
+  The edit path itself (`update_entry`, single-entry recompute, `PUT /entries/{uid}`)
+  is Phase 7.5; the L3 `needs_revalidation` self-heal is Phase 13/14.
+
+---
+
 ## Phase 5 — App shell UI + design system ✅
 
 **Status:** complete · **Date:** 2026-06-24

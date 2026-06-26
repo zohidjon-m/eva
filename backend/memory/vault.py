@@ -14,7 +14,9 @@ them.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import secrets
 import threading
 from collections.abc import Iterator
 from datetime import datetime
@@ -22,11 +24,37 @@ from pathlib import Path
 
 from llm import config
 
-# Matches one entry's header line, e.g. ``## 14:03:27 · chat``. The writer in
-# ``append_entry`` produces exactly this shape, so parsing splits the day-file
-# back into blocks on it. A user line that merely starts with ``##`` won't match
-# (it lacks the ``HH:MM:SS · type`` form), so prose is not mistaken for a header.
-_BLOCK_HEADER = re.compile(r"^## (\d{2}:\d{2}:\d{2}) · (\S+)$")
+# Matches one entry's header line, e.g. ``## 14:03:27 · chat · a1b2c3d4``. The
+# writer in ``append_entry`` produces exactly this shape, so parsing splits the
+# day-file back into blocks on it. The ``uid`` group is optional so legacy
+# day-files written before Phase 3.5 (``## 14:03:27 · chat``) still parse — they
+# come back with ``uid=None`` and are stamped by ``scripts/migrate_uids.py``. A
+# user line that merely starts with ``##`` won't match (it lacks the
+# ``HH:MM:SS · type`` form), so prose is not mistaken for a header.
+_BLOCK_HEADER = re.compile(r"^## (\d{2}:\d{2}:\d{2}) · (\S+)(?: · ([0-9a-f]+))?$")
+
+
+def new_uid() -> str:
+    """Mint a stable, content-independent entry id (8 hex chars).
+
+    Written into the L0 block header at capture time and never derived from the
+    text, so editing an entry never changes its ``uid`` — the property every upper
+    layer's evidence pointer relies on (Phase 3.5 / ADR-001). 32 bits is ample for
+    one person's journal; collisions are checked only at mint time. Zero
+    dependencies (``secrets`` is stdlib) keeps the offline contract intact.
+    """
+    return secrets.token_hex(4)
+
+
+def content_hash(text: str) -> str:
+    """Return a stable short hash of an entry's L0 text.
+
+    Stored beside an extraction as its ``source_hash`` so a rebuild can skip
+    entries whose text is unchanged and a future edit can be detected as "this
+    entry is dirty". Truncated SHA-256 — short enough to read, wide enough that an
+    accidental collision between two real entries is not a practical concern.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 # Serializes day-file writes so two concurrent turns can't both create the
 # frontmatter or interleave their appended blocks. A plain ``threading.Lock``
@@ -70,19 +98,25 @@ def append_entry(
     appended as a timestamped Markdown block — never rewritten, never reordered
     (append-only is what makes L0 trustworthy as the source of truth).
 
+    Each block header carries a freshly minted ``uid`` (Phase 3.5) —
+    ``## HH:MM:SS · type · uid`` — the stable identity every upper layer references
+    and the handle a future edit (Phase 7.5) addresses; it is written here, at
+    capture, so it lives in L0 itself and survives any rebuild.
+
     ``text`` is written verbatim — L0 is the user's unedited words and must match
     what the derived SQLite store keeps; trimming here would silently diverge the
     two. (Empty/whitespace-only turns are rejected upstream before they reach
     capture.)
 
-    Returns ``{"date", "time", "timestamp", "type", "path"}`` so the caller can
-    mirror the same identity into the derived SQLite store with a single shared
-    timestamp. Exists because durable capture must happen before — and
+    Returns ``{"date", "time", "timestamp", "type", "uid", "path"}`` so the caller
+    can mirror the same identity into the derived SQLite store with a single shared
+    timestamp and ``uid``. Exists because durable capture must happen before — and
     independent of — anything the model does; saving never waits on the LLM.
     """
     moment = when or datetime.now()
     date = moment.strftime("%Y-%m-%d")
     time = moment.strftime("%H:%M:%S")
+    uid = new_uid()
 
     path = day_path(date)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,13 +131,14 @@ def append_entry(
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             if is_new_day:
                 handle.write(f"---\ndate: {date}\n---\n\n# Journal — {date}\n")
-            handle.write(f"\n## {time} · {entry_type}\n\n{text}\n")
+            handle.write(f"\n## {time} · {entry_type} · {uid}\n\n{text}\n")
 
     return {
         "date": date,
         "time": time,
         "timestamp": moment.isoformat(timespec="seconds"),
         "type": entry_type,
+        "uid": uid,
         "path": str(path),
     }
 
@@ -112,14 +147,16 @@ def parse_day_file(path: Path) -> list[dict]:
     """Parse one day-file back into its list of entry blocks, in file order.
 
     The inverse of :func:`append_entry`'s write: it splits the Markdown on the
-    ``## HH:MM:SS · type`` block headers and returns one
-    ``{date, time, type, text, timestamp}`` per block. Frontmatter and the
-    ``# Journal —`` title (everything before the first block header) are skipped.
-    The structural blank lines the writer wraps each block in are stripped, while
-    blank lines *inside* a multi-paragraph entry are preserved (an internal blank
-    line is followed by more text, not by a header). Read-only — it never touches
-    the file. Exists so derived layers (re-extraction, re-indexing, the journal
-    UI) can read L0 back through one shared parser instead of re-implementing it.
+    ``## HH:MM:SS · type · uid`` block headers and returns one
+    ``{date, time, type, uid, text, timestamp}`` per block. ``uid`` is ``None`` for
+    legacy blocks written before Phase 3.5 (no uid in the header) — those are
+    stamped by ``scripts/migrate_uids.py``. Frontmatter and the ``# Journal —``
+    title (everything before the first block header) are skipped. The structural
+    blank lines the writer wraps each block in are stripped, while blank lines
+    *inside* a multi-paragraph entry are preserved (an internal blank line is
+    followed by more text, not by a header). Read-only — it never touches the file.
+    Exists so derived layers (re-extraction, re-indexing, the journal UI) can read
+    L0 back through one shared parser instead of re-implementing it.
     """
     date = path.stem
     lines = path.read_text(encoding="utf-8").split("\n")
@@ -129,7 +166,7 @@ def parse_day_file(path: Path) -> list[dict]:
     for index, start in enumerate(headers):
         match = _BLOCK_HEADER.match(lines[start])
         assert match is not None  # start came from a match above
-        time, entry_type = match.group(1), match.group(2)
+        time, entry_type, uid = match.group(1), match.group(2), match.group(3)
 
         end = headers[index + 1] if index + 1 < len(headers) else len(lines)
         body = lines[start + 1 : end]
@@ -143,6 +180,7 @@ def parse_day_file(path: Path) -> list[dict]:
                 "date": date,
                 "time": time,
                 "type": entry_type,
+                "uid": uid,
                 "text": "\n".join(body),
                 "timestamp": f"{date}T{time}",
             }

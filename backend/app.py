@@ -101,13 +101,18 @@ async def _extract_turn(entry_id: int, text: str) -> None:
         state = await server.ensure_running()
         if state.get("ready"):
             result = await extract.extract(text)
+            # Stamp the hash only for a real extraction — a null record (model
+            # down) leaves source_hash None so the next rebuild re-extracts it.
+            source_hash = vault.content_hash(text)
         else:
             result = extract.empty_extraction()  # model down → store nulls, not nothing
+            source_hash = None
         await asyncio.to_thread(
             db.save_extraction,
             entry_id,
             record=result,
             created_at=datetime.now().isoformat(timespec="seconds"),
+            source_hash=source_hash,
         )
     except Exception:  # noqa: BLE001 — background task must never propagate
         logger.exception("extraction failed for entry %s", entry_id)
@@ -172,6 +177,7 @@ async def chat(websocket: WebSocket) -> None:
         try:
             entry_id = await asyncio.to_thread(
                 db.insert_entry,
+                uid=record["uid"],
                 date=record["date"],
                 entry_type="chat",
                 text=user_message,

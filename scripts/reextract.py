@@ -1,20 +1,31 @@
 """Rebuild the derived database (L1) from the L0 Markdown vault.
 
-This is Eva's proof that the database is *derived, not truth*: it deletes the
-SQLite file and re-creates every entry and its full L1 episode record by reading
-the journal Markdown back and running extraction over it again. Run it after the
-L1 schema grows (it backfills the new fields onto entries captured under an older
-schema), or any time the database is lost or suspect.
+This is Eva's proof that the database is *derived, not truth*: it re-creates every
+entry and its full L1 episode record by reading the journal Markdown back and
+running extraction over it. Run it after the L1 schema grows (it backfills new
+fields onto entries captured under an older schema), or any time the database is
+lost or suspect.
 
 **L0 is read-only here.** The script only ever *reads* the journal files and
-*replaces* the rebuildable database — it never modifies a single byte of the
-user's words. Because it wipes and rebuilds from the same source, running it
-twice yields the same database (idempotent); entry ids are reassigned but every
-field and row count is reproduced.
+writes the rebuildable database — it never modifies a single byte of the user's
+words. Two properties make a rebuild safe (Phase 3.5 / ADR-001):
 
-Extraction needs the local model: with llama-server up, each entry yields its
-full record; with the model down, every field stores null (the same contract as
-live capture), so a *complete* rebuild requires the model running.
+- **Identity is preserved.** Each entry is matched to its row by the stable ``uid``
+  carried in L0 (``upsert_entry``), so a rebuild *reuses* the existing row instead
+  of minting a new id — every evidence pointer that cites an entry stays valid.
+- **The rebuild is hash-gated.** An entry whose L0 text is unchanged since its last
+  model-backed extraction (same ``source_hash``) is skipped — no model call — so a
+  second run is fast and only genuinely-changed (or never-extracted) entries are
+  re-run. This is the same mechanism a single-entry edit recompute (Phase 7.5) uses.
+
+If the on-disk schema predates Phase 3.5 (no ``uid`` column), the script rebuilds
+the database fresh once to migrate it, then proceeds. Legacy entries that have no
+``uid`` in L0 are refused — run ``scripts/migrate_uids.py`` first to stamp them.
+
+Extraction needs the local model: with llama-server up, each entry yields its full
+record; with the model down, every changed entry stores null (the same contract as
+live capture) and is left ungated so a later run re-extracts it — so a *complete*
+rebuild requires the model running.
 
 Usage (from the repo root, with the model available):
     python scripts/reextract.py
@@ -51,19 +62,19 @@ _REPORT_TABLES = (
 
 
 async def rebuild() -> None:
-    """Delete the derived DB and re-derive every entry + L1 record from L0.
+    """Re-derive every entry + L1 record from L0, preserving uids, hash-gated.
 
-    Removes the SQLite file, recreates the schema, ensures the model is up, then
-    replays the vault: for each entry in chronological order it re-inserts the row
-    and re-runs extraction into the full L1 record. Prints a per-table row count at
-    the end. Exists as the single, scriptable rebuild path the storage contract
-    promises — and as the migration tool when the schema changes.
+    Ensures the schema is current (rebuilding the file once if it predates Phase
+    3.5), ensures the model is up, then replays the vault: each entry is upserted
+    by its ``uid`` and re-extracted only when its text changed since the last
+    model-backed extraction. Prints per-table row counts plus how many entries were
+    extracted vs. skipped. Exists as the single, scriptable rebuild path the storage
+    contract promises — and as the migration tool when the schema changes.
     """
-    path = db.db_path()
-    if path.exists():
-        path.unlink()
-        print(f"removed {path}")
     db.init_db()
+    if not db.schema_is_current():
+        db.reset_db()
+        print("schema upgraded: rebuilt eva.db with uid/source_hash columns")
 
     state = await server.ensure_running()
     if not state.get("ready"):
@@ -73,27 +84,54 @@ async def rebuild() -> None:
             file=sys.stderr,
         )
 
-    count = 0
+    extracted = skipped = 0
     for entry in vault.iter_entries():
-        entry_id = db.insert_entry(
+        uid = entry["uid"]
+        if uid is None:
+            print(
+                f"error: entry at {entry['timestamp']} has no uid in L0. "
+                "Run `python scripts/migrate_uids.py` first to stamp legacy entries.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+        entry_id = db.upsert_entry(
+            uid=uid,
             date=entry["date"],
             entry_type=entry["type"],
             text=entry["text"],
             created_at=entry["timestamp"],
         )
+
+        # Hash gate: skip an entry already extracted from this exact text. A null
+        # extraction written while the model was down has source_hash None, so it
+        # never matches and is re-extracted here once the model is up.
+        new_hash = vault.content_hash(entry["text"])
+        if db.source_hash_for(entry_id) == new_hash:
+            skipped += 1
+            print(f"  [skip] {entry['timestamp']} · {entry['type']} · {uid}")
+            continue
+
         if state.get("ready"):
             record = await extract.extract(entry["text"])
+            source_hash = new_hash
         else:
             record = extract.empty_extraction()
+            source_hash = None  # leave ungated so a later run re-extracts it
         db.save_extraction(
             entry_id,
             record=record,
             created_at=datetime.now().isoformat(timespec="seconds"),
+            source_hash=source_hash,
         )
-        count += 1
-        print(f"  [{count}] {entry['timestamp']} · {entry['type']}")
+        extracted += 1
+        print(f"  [ext ] {entry['timestamp']} · {entry['type']} · {uid}")
 
-    print(f"\nrebuilt {count} entr{'y' if count == 1 else 'ies'} from L0:")
+    total = extracted + skipped
+    print(
+        f"\nrebuilt {total} entr{'y' if total == 1 else 'ies'} from L0 "
+        f"({extracted} extracted, {skipped} unchanged):"
+    )
     for table in _REPORT_TABLES:
         print(f"  {table:<16} {db.count_rows(table)}")
 

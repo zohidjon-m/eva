@@ -90,3 +90,58 @@ def test_deleting_entry_cascades_to_sub_rows(fresh_db):
 
     for table in ("extractions", "emotions", "entities", "goals", "behaviors", "decisions", "open_loops", "self_judgments"):
         assert db.count_rows(table) == 0
+
+
+# --- Phase 3.5: stable uid + content-hash dirty-tracking ---------------------
+
+@pytest.fixture()
+def fresh_vault(tmp_path, monkeypatch):
+    """An initialized empty Eva database in a temp vault (no entry yet)."""
+    monkeypatch.setenv("EVA_VAULT_DIR", str(tmp_path))
+    db.init_db()
+
+
+def test_schema_has_phase_35_columns(fresh_vault):
+    assert db.schema_is_current()  # entries.uid present after a fresh init
+
+
+def test_insert_stores_uid_and_lookup_round_trips(fresh_vault):
+    entry_id = db.insert_entry(
+        uid="abcd1234", date="2026-06-25", entry_type="chat", text="hi",
+        created_at="2026-06-25T10:00:00",
+    )
+    assert db.entry_id_for_uid("abcd1234") == entry_id
+    assert db.entry_id_for_uid("nope") is None
+
+
+def test_upsert_reuses_the_row_for_a_known_uid(fresh_vault):
+    # A rebuild re-running over the same L0 entry must reuse its row (stable id),
+    # updating the text in place rather than minting a second row.
+    first = db.upsert_entry(
+        uid="u1", date="2026-06-25", entry_type="chat", text="original",
+        created_at="2026-06-25T10:00:00",
+    )
+    second = db.upsert_entry(
+        uid="u1", date="2026-06-25", entry_type="chat", text="edited",
+        created_at="2026-06-25T10:00:00",
+    )
+    assert first == second
+    assert db.count_rows("entries") == 1
+    conn = db._connect()
+    assert conn.execute("SELECT text FROM entries WHERE id = ?", (first,)).fetchone()[0] == "edited"
+
+
+def test_source_hash_round_trips_and_gates(fresh_vault):
+    entry_id = db.insert_entry(
+        uid="u2", date="2026-06-25", entry_type="chat", text="x",
+        created_at="2026-06-25T10:00:00",
+    )
+    # No extraction yet → no hash, so a rebuild would not skip it.
+    assert db.source_hash_for(entry_id) is None
+
+    db.save_extraction(entry_id, record=_RECORD, created_at="t", source_hash="deadbeef")
+    assert db.source_hash_for(entry_id) == "deadbeef"
+
+    # Model-down path leaves the hash unset so the entry stays re-extractable.
+    db.save_extraction(entry_id, record=empty_extraction(), created_at="t")
+    assert db.source_hash_for(entry_id) is None

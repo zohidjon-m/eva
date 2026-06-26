@@ -7,9 +7,17 @@ file and the user loses nothing — ``scripts/reextract.py`` re-derives it from 
 Markdown.
 
 The schema is the full L1 episode record (Memory Architecture §1):
-- ``entries``        — one row per captured turn (id, date, type, text, created_at)
+- ``entries``        — one row per captured turn (id, ``uid``, date, type, text,
+  created_at). ``uid`` is the **stable, content-independent identity** (Phase 3.5):
+  it is minted in L0 at write time, survives a full rebuild (``reextract.py`` reads
+  it back from the Markdown rather than reassigning it), and is the key every upper
+  layer's evidence pointer references — so editing an entry's text never breaks the
+  pointers that cite it.
 - ``extractions``    — the 1:1 scalar/summary part of an entry's L1 record
   (summary, mood, themes, events), filled in asynchronously after the save.
+  ``source_hash`` records the hash of the L0 text this extraction was computed from,
+  so a rebuild can **skip entries whose text is unchanged** (the hash gate) and an
+  edit can be detected as "this entry is dirty, recompute it".
 - Seven 1:many sub-tables keyed to ``entry_id`` hold the structured fields the
   upper layers reason over: ``emotions``, ``entities``, ``goals``, ``behaviors``,
   ``decisions``, ``open_loops``, ``self_judgments``. ``behaviors`` is kept
@@ -40,6 +48,7 @@ from llm import config
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid        TEXT UNIQUE,
     date       TEXT NOT NULL,
     type       TEXT NOT NULL,
     text       TEXT NOT NULL,
@@ -47,12 +56,13 @@ CREATE TABLE IF NOT EXISTS entries (
 );
 
 CREATE TABLE IF NOT EXISTS extractions (
-    entry_id   INTEGER PRIMARY KEY,
-    summary    TEXT,
-    mood       INTEGER,
-    themes     TEXT,
-    events     TEXT,
-    created_at TEXT NOT NULL,
+    entry_id    INTEGER PRIMARY KEY,
+    summary     TEXT,
+    mood        INTEGER,
+    themes      TEXT,
+    events      TEXT,
+    source_hash TEXT,
+    created_at  TEXT NOT NULL,
     FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
 );
 
@@ -177,21 +187,109 @@ def init_db() -> None:
         conn.commit()
 
 
-def insert_entry(*, date: str, entry_type: str, text: str, created_at: str) -> int:
+def insert_entry(
+    *, uid: str | None = None, date: str, entry_type: str, text: str, created_at: str
+) -> int:
     """Insert one captured entry and return its new row id.
 
-    The id is the join key the background extraction uses to attach its result.
-    Takes the same ``date``/``created_at`` the vault recorded so the Markdown and
-    the database describe the identical moment. Exists as the single write path
-    for captured turns.
+    The row ``id`` is the internal join key the sub-tables use; ``uid`` is the
+    stable external identity the vault minted (Phase 3.5) and the one upper layers
+    reference. Takes the same ``date``/``created_at`` the vault recorded so the
+    Markdown and the database describe the identical moment. Exists as the single
+    write path for freshly captured turns (``reextract`` uses :func:`upsert_entry`
+    so a rebuild reuses the existing row instead of minting a new id).
     """
     with closing(_connect()) as conn:
         cursor = conn.execute(
-            "INSERT INTO entries (date, type, text, created_at) VALUES (?, ?, ?, ?)",
-            (date, entry_type, text, created_at),
+            "INSERT INTO entries (uid, date, type, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            (uid, date, entry_type, text, created_at),
         )
         conn.commit()
         return int(cursor.lastrowid)
+
+
+def entry_id_for_uid(uid: str) -> int | None:
+    """Return the row id of the entry with this ``uid``, or ``None`` if absent.
+
+    The lookup from the stable L0 identity to the internal row id. Exists so the
+    rebuild and (Phase 7.5) the single-entry recompute can find the existing row
+    for a ``uid`` instead of creating a duplicate.
+    """
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT id FROM entries WHERE uid = ?", (uid,)).fetchone()
+        return int(row["id"]) if row is not None else None
+
+
+def upsert_entry(
+    *, uid: str, date: str, entry_type: str, text: str, created_at: str
+) -> int:
+    """Insert the entry for ``uid`` or update it in place; return its row id.
+
+    Keyed on the stable ``uid``: a rebuild (or a future edit) re-running over L0
+    reuses the same row — so the row ``id`` and every evidence pointer that cites
+    the entry stay valid, instead of being reassigned the way a delete-and-reinsert
+    would. Updating ``text`` keeps the FTS index in sync via the ``entries_au``
+    trigger. Exists as the identity-preserving write path ``reextract.py`` needs.
+    """
+    with closing(_connect()) as conn:
+        row = conn.execute("SELECT id FROM entries WHERE uid = ?", (uid,)).fetchone()
+        if row is not None:
+            entry_id = int(row["id"])
+            conn.execute(
+                "UPDATE entries SET date = ?, type = ?, text = ?, created_at = ? WHERE id = ?",
+                (date, entry_type, text, created_at, entry_id),
+            )
+            conn.commit()
+            return entry_id
+        cursor = conn.execute(
+            "INSERT INTO entries (uid, date, type, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            (uid, date, entry_type, text, created_at),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def source_hash_for(entry_id: int) -> str | None:
+    """Return the ``source_hash`` stored for an entry's extraction, or ``None``.
+
+    ``None`` means either no extraction row yet or one written while the model was
+    down (which deliberately leaves the hash unset so the next rebuild re-extracts
+    it). The rebuild compares this against the current L0 text hash to decide
+    whether an entry is unchanged and can be skipped — the hash gate.
+    """
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT source_hash FROM extractions WHERE entry_id = ?", (entry_id,)
+        ).fetchone()
+        return row["source_hash"] if row is not None else None
+
+
+def schema_is_current() -> bool:
+    """Return whether the on-disk schema has the Phase 3.5 columns.
+
+    A pre-3.5 database lacks the ``entries.uid`` column; ``CREATE TABLE IF NOT
+    EXISTS`` can't add it to an existing table, so the rebuild detects the stale
+    schema with this check and rebuilds fresh (the project's "upgrade = rebuild,
+    no ALTER migration" policy). Exists so ``reextract.py`` can migrate the schema
+    without a hand-written ALTER.
+    """
+    with closing(_connect()) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(entries)")}
+        return "uid" in columns
+
+
+def reset_db() -> None:
+    """Delete the derived database file and recreate the current schema.
+
+    The destructive rebuild path: because the DB is derived and rebuildable from
+    L0, a schema change is handled by dropping the whole file and re-deriving, not
+    by in-place migration. ``reextract.py`` calls this only when the schema is
+    stale; L0 is never touched.
+    """
+    path = db_path()
+    if path.exists():
+        path.unlink()
+    init_db()
 
 
 # The seven sub-tables whose rows belong to one entry. ``save_extraction``
@@ -207,7 +305,9 @@ _SUB_TABLES = (
 )
 
 
-def save_extraction(entry_id: int, *, record: dict, created_at: str) -> None:
+def save_extraction(
+    entry_id: int, *, record: dict, created_at: str, source_hash: str | None = None
+) -> None:
     """Store (or replace) the full L1 episode record for an entry.
 
     ``record`` is the normalized dict from :func:`memory.extract.parse_extraction`
@@ -216,6 +316,12 @@ def save_extraction(entry_id: int, *, record: dict, created_at: str) -> None:
     a half-applied extraction: the scalar part goes to ``extractions`` (themes and
     events as JSON, since SQLite has no list type and they need no cross-entry
     keying), and each structured field fans out into its sub-table.
+
+    ``source_hash`` is the hash of the L0 text this record was derived from (see
+    :func:`memory.vault.content_hash`). Callers pass it **only for a real
+    model-backed extraction** and leave it ``None`` when the model was down (so the
+    null record is re-extracted on the next rebuild instead of being mistaken for
+    up-to-date). The rebuild's hash gate reads it back via :func:`source_hash_for`.
 
     Idempotency is the point of the delete-then-insert: ``INSERT OR REPLACE`` keeps
     the ``extractions`` row unique by ``entry_id``, and clearing the sub-tables for
@@ -229,8 +335,8 @@ def save_extraction(entry_id: int, *, record: dict, created_at: str) -> None:
         conn.execute(
             """
             INSERT OR REPLACE INTO extractions
-                (entry_id, summary, mood, themes, events, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (entry_id, summary, mood, themes, events, source_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entry_id,
@@ -238,6 +344,7 @@ def save_extraction(entry_id: int, *, record: dict, created_at: str) -> None:
                 record.get("mood"),
                 json.dumps(record.get("themes") or []),
                 json.dumps(record.get("events") or []),
+                source_hash,
                 created_at,
             ),
         )
